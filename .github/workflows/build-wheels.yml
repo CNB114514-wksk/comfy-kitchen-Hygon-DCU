@@ -1,0 +1,1037 @@
+name: Build Wheels
+
+on:
+  # Disabled in this DCU fork: the upstream matrix builds AMD/CUDA wheels and
+  # cannot produce gfx9 (Hygon DCU) binaries. Kept for reference; run manually
+  # from the Actions tab if you want to experiment.
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build_wheels_linux:
+    name: Build Linux wheels
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-4.13.6-linux-x86_64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'comfy_kitchen/backends/hip/**', 'third_party/cutlass/.git') }}
+          restore-keys: |
+            ccache-4.13.6-linux-x86_64-cuda13-
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Build one wheel containing both CUDA and HIP native extensions.
+      # cibuildwheel invokes setup.py once inside a manylinux container. The
+      # explicit HIP opt-in emits cuda/_C*.so plus hip/_C*.so.
+      - name: Build CUDA+HIP wheel (manylinux)
+        uses: pypa/cibuildwheel@v2.22.0
+        env:
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+
+          # Build for Python 3.10, 3.11, and 3.12
+          # 3.10/3.11 will be version-specific, 3.12 will be abi3 (stable ABI)
+          CIBW_BUILD: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
+          CIBW_SKIP: "*-musllinux_*"
+
+          # Install CUDA 13.0 and ROCm HIP SDK inside the same container so the
+          # wheel contains both native backends.
+          CIBW_BEFORE_ALL_LINUX: |
+            # Install dnf plugins for config-manager command
+            dnf install -y dnf-plugins-core
+            # Add NVIDIA CUDA repository for RHEL 8
+            dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+            # Add AMD ROCm repository for RHEL 8 / manylinux_2_28. Signature checks
+            # stay on: these RPMs carry the compiler that builds the shipped wheel.
+            printf '%s\n' \
+              '[rocm]' \
+              'name=ROCm 7.2 repository' \
+              'baseurl=https://repo.radeon.com/rocm/el8/7.2.4/main' \
+              'enabled=1' \
+              'priority=50' \
+              'gpgcheck=1' \
+              'gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key' \
+              '' \
+              '[amdgraphics]' \
+              'name=AMD Graphics 7.2 repository' \
+              'baseurl=https://repo.radeon.com/graphics/7.2.4/el/8/main/x86_64/' \
+              'enabled=1' \
+              'priority=50' \
+              'gpgcheck=1' \
+              'gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key' \
+              >/etc/yum.repos.d/rocm.repo
+            rpm --import https://repo.radeon.com/rocm/rocm.gpg.key
+            dnf clean all
+            # Install only the CUDA packages needed for compilation, plus HIP SDK.
+            dnf install -y cuda-nvcc-13-0 cuda-cudart-devel-13-0 libcublas-devel-13-0 libnvjitlink-devel-13-0
+            dnf install -y rocm-hip-sdk rocm-device-libs
+            # Install Python development headers (fallback for CMake FindPython)
+            dnf install -y python3-devel curl ninja-build tar xz
+            # EL8 ships ccache 3.7.7, which predates NVCC -x cu handling.
+            # Use the same pinned modern ccache release on both Linux architectures.
+            CCACHE_VERSION=4.13.6
+            CCACHE_ARCH=$(uname -m)
+            case "$CCACHE_ARCH" in
+              x86_64) CCACHE_SHA256=156ec57c5198cc849d92834023d09910b83dc5504c6cf405d09e6ae7b208a3e5 ;;
+              aarch64) CCACHE_SHA256=2098d561e4a8e36bd06a29aedce53ea90c7e365f9573a93d91c230efbf96a958 ;;
+              *) echo "Unsupported ccache architecture: $CCACHE_ARCH" >&2; exit 1 ;;
+            esac
+            CCACHE_ARCHIVE="ccache-$CCACHE_VERSION-linux-$CCACHE_ARCH-musl-static.tar.xz"
+            curl --fail --location --retry 3 --silent --show-error "https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/$CCACHE_ARCHIVE" --output "/tmp/$CCACHE_ARCHIVE"
+            echo "$CCACHE_SHA256  /tmp/$CCACHE_ARCHIVE" | sha256sum --check
+            tar -xJf "/tmp/$CCACHE_ARCHIVE" -C /tmp
+            install -m 755 "/tmp/${CCACHE_ARCHIVE%.tar.xz}/ccache" /usr/local/bin/ccache
+            ccache --version
+            # Reset counters, but retain restored compiler objects.
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache ccache --zero-stats
+            # Verify compiler installations
+            /usr/local/cuda-13.0/bin/nvcc --version
+            /opt/rocm/bin/amdclang++ --version
+            /opt/rocm/bin/hipcc --version
+
+          # Set CUDA and ROCm environments.
+          CIBW_ENVIRONMENT_LINUX: >
+            CUDA_HOME=/usr/local/cuda-13.0
+            ROCM_HOME=/opt/rocm
+            ROCM_PATH=/opt/rocm
+            PATH=/usr/local/cuda-13.0/bin:/opt/rocm/bin:$PATH
+            LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH
+            LIBRARY_PATH=/usr/local/cuda-13.0/lib64/stubs:$LIBRARY_PATH
+            CMAKE_GENERATOR=Ninja
+            COMFY_KITCHEN_BUILD_HIP=1
+            COMFY_CUDA_COMPILER_LAUNCHER=ccache
+            COMFY_CXX_COMPILER_LAUNCHER=ccache
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache
+            CCACHE_BASEDIR=/project
+            CCACHE_COMPILERCHECK=content
+          # COMFY_HIP_ARCHS is unset on purpose: with no AMD GPU visible,
+          # setup_hip_extension() already builds DEFAULT_HIP_ARCHS.
+
+          # Report the previous interpreter build's cache result, then install build dependencies.
+          CIBW_BEFORE_BUILD: |
+            python --version
+            ccache --show-stats
+            pip install nanobind cmake setuptools wheel
+
+          # Repair wheel for manylinux compliance, excluding GPU runtime libs.
+          # Users must have the matching CUDA or ROCm runtime installed locally.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            auditwheel repair -w {dest_dir} {wheel}
+            --exclude libcuda.so.1
+            --exclude libcudart.so.13
+            --exclude libnvrtc.so.13
+            --exclude libcublas.so.13
+            --exclude libcublasLt.so.13
+            --exclude libnvJitLink.so.13
+            --exclude libamdhip64.so.7
+            --exclude libamdhip64.so
+            --exclude libhsa-runtime64.so.1
+            --exclude libhsa-runtime64.so
+            --exclude libamd_comgr.so.3
+            --exclude libamd_comgr.so
+            --exclude libdrm.so.2
+            --exclude libdrm_amdgpu.so.1
+            --exclude librocm-core.so.1
+
+        with:
+          output-dir: wheelhouse
+
+      - name: Report final compiler-cache statistics
+        shell: bash
+        run: |
+          ccache_version=4.13.6
+          archive="$RUNNER_TEMP/ccache-$ccache_version-linux-x86_64-musl-static.tar.xz"
+          curl --fail --location --retry 3 --silent --show-error "https://github.com/ccache/ccache/releases/download/v$ccache_version/ccache-$ccache_version-linux-x86_64-musl-static.tar.xz" --output "$archive"
+          echo "156ec57c5198cc849d92834023d09910b83dc5504c6cf405d09e6ae7b208a3e5  $archive" | sha256sum --check
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" "$RUNNER_TEMP/ccache-$ccache_version-linux-x86_64-musl-static/ccache" --show-stats
+
+      - name: Verify Linux wheels contain CUDA and HIP extensions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          wheels = sorted(Path("wheelhouse").glob("*manylinux*.whl"))
+          if not wheels:
+              raise SystemExit("No manylinux wheels found")
+
+          for wheel in wheels:
+              # 3.10/3.11 are version-specific; 3.12 must stay abi3 or it silently
+              # stops covering 3.13+. Assert the tag before the member checks below.
+              pytag, abitag = wheel.name.split("-")[-3:-1]
+              if pytag == "cp312" and abitag != "abi3":
+                  raise SystemExit(f"{wheel.name}: cp312 wheel lost its abi3 tag (got {abitag})")
+              with zipfile.ZipFile(wheel) as zf:
+                  names = zf.namelist()
+              has_cuda = any(
+                  name.startswith("comfy_kitchen/backends/cuda/_C") and name.endswith(".so")
+                  for name in names
+              )
+              has_hip = any(
+                  name.startswith("comfy_kitchen/backends/hip/_C") and name.endswith(".so")
+                  for name in names
+              )
+              print(f"{wheel.name}: cuda={has_cuda} hip={has_hip}")
+              if not has_cuda or not has_hip:
+                  raise SystemExit(f"{wheel.name} does not contain both CUDA and HIP extensions")
+          PY
+
+      - name: Build CPU-only wheel (py3-none-any)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install build setuptools wheel
+          # Build pure Python variant (no native CUDA/HIP extensions)
+          python setup.py bdist_wheel --no-cuda --no-hip
+          # Move to wheelhouse directory
+          mv dist/*py3-none-any.whl wheelhouse/
+
+      - name: List built wheels
+        shell: bash
+        run: |
+          ls -lh wheelhouse/
+          echo "Built wheels:"
+          ls -1 wheelhouse/*.whl
+
+      - name: Upload Linux CUDA+HIP wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-cuda-hip
+          path: wheelhouse/*manylinux*.whl
+          if-no-files-found: error
+
+      - name: Upload CPU-only wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cpu-only
+          path: wheelhouse/*py3-none-any.whl
+          if-no-files-found: error
+
+  build_wheels_linux_arm64:
+    name: Build Linux ARM64 wheels
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-4.13.6-linux-aarch64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          restore-keys: |
+            ccache-4.13.6-linux-aarch64-cuda13-
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Build CUDA wheel using cibuildwheel with manylinux container for ARM64
+      - name: Build CUDA wheel (manylinux ARM64)
+        uses: pypa/cibuildwheel@v2.22.0
+        env:
+          # Use manylinux_2_28 for ARM64
+          CIBW_MANYLINUX_AARCH64_IMAGE: quay.io/pypa/manylinux_2_28_aarch64
+
+          # Build for Python 3.10, 3.11, and 3.12 on ARM64
+          CIBW_BUILD: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64"
+          CIBW_SKIP: "*-musllinux_*"
+
+          # Native ARM64 runner - no emulation needed
+          CIBW_ARCHS_LINUX: aarch64
+
+          # Install CUDA 13.0 toolkit inside the container (using sbsa repo for ARM64)
+          CIBW_BEFORE_ALL_LINUX: |
+            # Install dnf plugins for config-manager command
+            dnf install -y dnf-plugins-core
+            # Add NVIDIA CUDA repository for RHEL 8 ARM64 (sbsa = server-based system architecture)
+            dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/sbsa/cuda-rhel8.repo
+            dnf clean all
+            # Install ONLY the minimal CUDA packages needed for compilation (not the full toolkit)
+            dnf install -y cuda-nvcc-13-0 cuda-cudart-devel-13-0 libcublas-devel-13-0 libnvjitlink-devel-13-0
+            # Install Python development headers (fallback for CMake FindPython)
+            dnf install -y python3-devel curl ninja-build tar xz
+            # EL8 ships ccache 3.7.7, which predates NVCC -x cu handling.
+            # Use the same pinned modern ccache release on both Linux architectures.
+            CCACHE_VERSION=4.13.6
+            CCACHE_ARCH=$(uname -m)
+            case "$CCACHE_ARCH" in
+              x86_64) CCACHE_SHA256=156ec57c5198cc849d92834023d09910b83dc5504c6cf405d09e6ae7b208a3e5 ;;
+              aarch64) CCACHE_SHA256=2098d561e4a8e36bd06a29aedce53ea90c7e365f9573a93d91c230efbf96a958 ;;
+              *) echo "Unsupported ccache architecture: $CCACHE_ARCH" >&2; exit 1 ;;
+            esac
+            CCACHE_ARCHIVE="ccache-$CCACHE_VERSION-linux-$CCACHE_ARCH-musl-static.tar.xz"
+            curl --fail --location --retry 3 --silent --show-error "https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/$CCACHE_ARCHIVE" --output "/tmp/$CCACHE_ARCHIVE"
+            echo "$CCACHE_SHA256  /tmp/$CCACHE_ARCHIVE" | sha256sum --check
+            tar -xJf "/tmp/$CCACHE_ARCHIVE" -C /tmp
+            install -m 755 "/tmp/${CCACHE_ARCHIVE%.tar.xz}/ccache" /usr/local/bin/ccache
+            ccache --version
+            # Reset counters, but retain restored compiler objects.
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache ccache --zero-stats
+            # Verify CUDA installation
+            /usr/local/cuda-13.0/bin/nvcc --version
+
+          # Set CUDA environment and install build dependencies
+          CIBW_ENVIRONMENT_LINUX: >
+            CUDA_HOME=/usr/local/cuda-13.0
+            PATH=/usr/local/cuda-13.0/bin:$PATH
+            LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH
+            LIBRARY_PATH=/usr/local/cuda-13.0/lib64/stubs:$LIBRARY_PATH
+            CMAKE_GENERATOR=Ninja
+            COMFY_CUDA_COMPILER_LAUNCHER=ccache
+            COMFY_CXX_COMPILER_LAUNCHER=ccache
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache
+            CCACHE_BASEDIR=/project
+            CCACHE_COMPILERCHECK=content
+
+          # Report the previous interpreter build's cache result, then install build dependencies.
+          CIBW_BEFORE_BUILD: |
+            python --version
+            ccache --show-stats
+            pip install nanobind cmake setuptools wheel
+
+          # Repair wheel for manylinux compliance, excluding CUDA runtime libs
+          # Users must have CUDA installed on their system
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            auditwheel repair -w {dest_dir} {wheel}
+            --exclude libcuda.so.1
+            --exclude libcudart.so.13
+            --exclude libnvrtc.so.13
+            --exclude libcublas.so.13
+            --exclude libcublasLt.so.13
+            --exclude libnvJitLink.so.13
+
+        with:
+          output-dir: wheelhouse
+
+      - name: Report final compiler-cache statistics
+        shell: bash
+        run: |
+          ccache_version=4.13.6
+          archive="$RUNNER_TEMP/ccache-$ccache_version-linux-aarch64-musl-static.tar.xz"
+          curl --fail --location --retry 3 --silent --show-error "https://github.com/ccache/ccache/releases/download/v$ccache_version/ccache-$ccache_version-linux-aarch64-musl-static.tar.xz" --output "$archive"
+          echo "2098d561e4a8e36bd06a29aedce53ea90c7e365f9573a93d91c230efbf96a958  $archive" | sha256sum --check
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" "$RUNNER_TEMP/ccache-$ccache_version-linux-aarch64-musl-static/ccache" --show-stats
+
+      - name: List built wheels
+        shell: bash
+        run: |
+          ls -lh wheelhouse/
+          echo "Built wheels:"
+          ls -1 wheelhouse/*.whl
+
+      - name: Upload Linux ARM64 CUDA wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-arm64-cuda
+          path: wheelhouse/*manylinux*.whl
+          if-no-files-found: error
+
+  build_wheels_windows:
+    name: Build Windows wheel (Python ${{ matrix.python-version }})
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-windows-x86_64-cuda13-py${{ matrix.python-version }}-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'comfy_kitchen/backends/hip/**', 'third_party/cutlass/.git') }}
+          restore-keys: |
+            ccache-windows-x86_64-cuda13-py${{ matrix.python-version }}-
+            ccache-windows-x86_64-cuda13-
+
+      - name: Install compiler cache and Ninja
+        shell: pwsh
+        run: choco install ccache ninja --no-progress --yes
+      - name: Install CUDA Toolkit 13.0.2
+        uses: Jimver/cuda-toolkit@v0.2.29
+        id: cuda-toolkit
+        with:
+          cuda: '13.0.2'
+          method: 'network'
+          use-github-cache: 'true'
+          log-file-suffix: 'windows-2022.txt'
+
+      - name: Set compiler-cache and CUDA environment
+        shell: pwsh
+        run: |
+          echo "CUDA_PATH_V13_0=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "COMFY_CUDA_COMPILER_LAUNCHER=ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "COMFY_CXX_COMPILER_LAUNCHER=ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_DIR=$env:GITHUB_WORKSPACE\.ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_COMPILERCHECK=content" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify CUDA installation
+        shell: bash
+        run: |
+          echo "CUDA_HOME: $CUDA_HOME"
+          echo "CUDA_PATH: $CUDA_PATH"
+          nvcc --version
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create python3.lib for stable ABI
+        if: matrix.python-version == '3.12'
+        shell: pwsh
+        run: |
+          # Create python3.lib for stable ABI support
+          $pythonDir = Split-Path -Parent (Get-Command python).Source
+          $libsDir = Join-Path $pythonDir "libs"
+          $pythonLib = Get-ChildItem -Path $libsDir -Filter "python3*.lib" | Where-Object { $_.Name -match "python3\d+\.lib" } | Select-Object -First 1
+          
+          if ($pythonLib) {
+            $python3Lib = Join-Path $libsDir "python3.lib"
+            if (-not (Test-Path $python3Lib)) {
+              Copy-Item -Path $pythonLib.FullName -Destination $python3Lib
+              Write-Host "Created python3.lib for stable ABI"
+            }
+          } else {
+            Write-Error "Could not find python3XX.lib"
+            exit 1
+          }
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.27.0"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # ninja: CMake's default Windows generator is Visual Studio, which has no
+          # HIP language support, so setup.py drives the HIP build with Ninja.
+          pip install build setuptools wheel nanobind ninja
+
+      - name: Install ROCm HIP SDK (Windows)
+        shell: bash
+        env:
+          ROCM_SDK_VERSION: "7.2.1"
+        run: |
+          # ROCm on Windows is not on PyPI (pypi.org/project/rocm-sdk-devel is a 0.1.0
+          # placeholder), so the toolchain comes from AMD's own release directory, the
+          # same host the Linux job takes its RPMs from. Pinned to a versioned release,
+          # so the toolchain cannot drift under a given commit.
+          #
+          # setup.py finds the toolchain via `python -m rocm_sdk path --root`; no
+          # ROCM_PATH and no Visual Studio developer shell are needed.
+          #
+          # [libraries] is not optional here even though these kernels never call
+          # hipBLAS: expanding the devel tree hardlinks against it, and the install
+          # fails without it. The compiler it ships is not tied to a GPU family and
+          # builds every gfx in COMFY_HIP_ARCHS, RDNA2 through RDNA4.
+          #
+          # --no-index keeps the whole resolve inside AMD's directory rather than
+          # leaving PyPI open for it, and PyPI does hold placeholder projects under
+          # these names. The meta-package is an sdist, so --no-build-isolation is
+          # what lets its build requirements come from the step above instead of an
+          # index that is no longer reachable.
+          pip install --no-index --no-build-isolation \
+            --find-links "https://repo.radeon.com/rocm/windows/rocm-rel-${ROCM_SDK_VERSION}/" \
+            "rocm[libraries,devel]==${ROCM_SDK_VERSION}"
+          python -m rocm_sdk path --root
+
+      - name: Build CUDA+HIP wheel
+        shell: bash
+        env:
+          COMFY_KITCHEN_BUILD_HIP: "1"
+        run: |
+          # The explicit HIP opt-in emits cuda/_C* plus hip/_C* into one wheel.
+          # Python 3.12 produces an abi3 wheel (both extensions are built
+          # against the limited API); 3.10/3.11 stay version-specific.
+          #
+          # COMFY_HIP_ARCHS is unset on purpose: with no AMD GPU visible,
+          # setup_hip_extension() already builds DEFAULT_HIP_ARCHS.
+          python setup.py bdist_wheel
+
+      - name: Verify the Windows wheel contains CUDA and HIP extensions
+        shell: bash
+        run: |
+          pip install pefile
+          python - <<'PY'
+          import re
+          import zipfile
+          from pathlib import Path
+
+          import pefile
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if not wheels:
+              raise SystemExit("No wheels found")
+
+          for wheel in wheels:
+              # 3.10/3.11 are version-specific; 3.12 must stay abi3 or it silently
+              # stops covering 3.13+. Assert the tag before the member/linkage checks.
+              pytag, abitag = wheel.name.split("-")[-3:-1]
+              if pytag == "cp312" and abitag != "abi3":
+                  raise SystemExit(f"{wheel.name}: cp312 wheel lost its abi3 tag (got {abitag})")
+              with zipfile.ZipFile(wheel) as zf:
+                  names = zf.namelist()
+                  pyds = [n for n in names
+                          if n.startswith("comfy_kitchen/backends/") and n.endswith(".pyd")]
+
+                  def has(backend):
+                      return any(
+                          n.startswith(f"comfy_kitchen/backends/{backend}/_C")
+                          and n.endswith(".pyd")
+                          for n in names
+                      )
+                  print(f"{wheel.name}: cuda={has('cuda')} hip={has('hip')}")
+                  if not has("cuda") or not has("hip"):
+                      raise SystemExit(f"{wheel.name} does not contain both extensions")
+
+                  # An abi3-tagged wheel must link the stable python3.dll, not a
+                  # versioned interpreter DLL, or it is version-locked despite the tag.
+                  if "abi3" in wheel.name:
+                      for n in pyds:
+                          # No import directory means no python3.dll either, which
+                          # the check below reports; the attribute is absent rather
+                          # than empty in that case.
+                          pe = pefile.PE(data=zf.read(n))
+                          imports = {
+                              entry.dll.decode("ascii", "replace").lower()
+                              for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
+                          }
+                          versioned = sorted(d for d in imports if re.fullmatch(r"python3\d+\.dll", d))
+                          if "python3.dll" not in imports or versioned:
+                              raise SystemExit(
+                                  f"{wheel.name}:{n} is not stable-ABI linked "
+                                  f"(python3.dll missing or versioned {versioned})"
+                              )
+                          print(f"  {n}: abi3 OK (links python3.dll)")
+          PY
+
+      - name: Report compiler-cache statistics
+        shell: pwsh
+        run: ccache --show-stats
+
+      - name: List built wheels
+        shell: bash
+        run: |
+          ls -lh dist/
+          echo "Built wheels:"
+          ls -1 dist/*.whl
+
+      - name: Upload Windows wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-cuda-hip-${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  test_linux:
+    name: Test on Linux (Python ${{ matrix.python-version }})
+    needs: build_wheels_linux
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download CPU-only wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-cpu-only
+          path: dist/
+
+      - name: Install wheel and test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Install CPU-only PyTorch first (smaller download, no CUDA needed for CI)
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Install the CPU-only wheel (py3-none-any works everywhere)
+          pip install dist/*py3-none-any.whl
+          pip install pytest ruff
+
+      - name: Ruff check
+        shell: bash
+        run: |
+          ruff check .
+
+      - name: Run tests
+        shell: bash
+        run: |
+          # Run all tests - conftest handles backend availability
+          # Tests requiring CUDA will be skipped on CPU-only runners
+          python -m pytest tests/ -v --tb=short
+
+  test_windows:
+    name: Test on Windows (Python ${{ matrix.python-version }})
+    needs: build_wheels_windows
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download Windows wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-cuda-hip-${{ matrix.python-version }}
+          path: dist/
+
+      - name: Install wheel and test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Install CPU-only PyTorch first (smaller download, no CUDA needed for CI)
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Windows: install the CUDA wheel (will work in CPU-only mode)
+          pip install dist/*.whl
+          pip install pytest ruff
+
+      - name: Ruff check
+        shell: bash
+        run: |
+          ruff check .
+
+      - name: Run tests
+        shell: bash
+        run: |
+          # Run all tests - conftest handles backend availability
+          # Tests requiring CUDA will be skipped on CPU-only runners
+          python -m pytest tests/ -v --tb=short
+
+  # Windows on ARM CUDA wheels via CUDA Toolkit 13.4 developer preview
+  # (https://packages.nvidia.com/prerelease/cuda/13.4.0/...).
+  # WoA ships only the Stable ABI (cp312-abi3) wheel — no 3.10/3.11 builds.
+  build_wheels_windows_arm:
+    name: Build Windows ARM abi3 wheel
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-windows-arm64-cuda13.4-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          restore-keys: |
+            ccache-windows-arm64-cuda13.4-
+
+      - name: Install compiler cache
+        shell: pwsh
+        run: choco install ccache --no-progress --yes
+
+      - name: Cache CUDA 13.4 WoA installer
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cuda_installer
+          key: cuda-13.4.0-windows-arm64-local-installer
+
+      - name: Download CUDA Toolkit 13.4 (Windows ARM64)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "cuda_installer"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $installer = Join-Path $dir "cuda_13.4.0_windows_arm64.exe"
+          if ((Test-Path $installer) -and (Get-Item $installer).Length -lt 3GB) {
+            Write-Warning "Discarding incomplete cached CUDA installer"
+            Remove-Item $installer -Force
+          }
+          if (-not (Test-Path $installer)) {
+            $uri = "https://packages.nvidia.com/prerelease/cuda/13.4.0/local_installers/cuda_13.4.0_windows_arm64.exe"
+            $partial = "$installer.part"
+            Write-Host "Downloading $uri"
+            curl.exe `
+              --fail `
+              --location `
+              --retry 5 `
+              --retry-all-errors `
+              --retry-delay 10 `
+              --continue-at - `
+              --output $partial `
+              $uri
+            if ($LASTEXITCODE -ne 0) {
+              throw "CUDA installer download failed with curl exit code $LASTEXITCODE"
+            }
+            Move-Item -Path $partial -Destination $installer
+          }
+          Get-Item $installer | Format-List FullName, Length
+
+      - name: Install CUDA Toolkit 13.4
+        id: install-cuda
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_installer\cuda_13.4.0_windows_arm64.exe"
+          $logDir = Join-Path $env:RUNNER_TEMP "cuda_install_logs"
+          $diagDir = Join-Path $env:RUNNER_TEMP "woa_cuda_diagnostics"
+          New-Item -ItemType Directory -Force -Path $logDir, $diagDir | Out-Null
+
+          Write-Host "=== Runner diagnostics ==="
+          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
+          Write-Host "PROCESSOR_IDENTIFIER=$env:PROCESSOR_IDENTIFIER"
+          [System.Environment]::OSVersion | Format-List | Out-String | Write-Host
+          Write-Host "Installer: $installer"
+          Write-Host "Log dir: $logDir"
+
+          # Minimal compile-time packages (mirrors Linux CI). -n skips reboot.
+          # -log / -loglevel:6 writes verbose NVIDIA installer logs for first-run debugging.
+          $packages = @(
+            "nvcc_13.4",
+            "cudart_13.4",
+            "crt_13.4",
+            "cublas_13.4",
+            "cublas_dev_13.4",
+            "nvjitlink_13.4",
+            "nvvm_13.4",
+            "thrust_13.4",
+            "visual_studio_integration_13.4"
+          )
+          # Pass -log as a single argv token; path has no spaces on GHA runners.
+          $installArgs = @("-s", "-n", "-log:$logDir", "-loglevel:6") + $packages
+          Write-Host "Installing CUDA packages: $($packages -join ', ')"
+          Write-Host "Command: $installer $($installArgs -join ' ')"
+          # The CUDA executable is a bootstrapper: direct invocation returns
+          # after spawning the real installer and leaves $LASTEXITCODE unset.
+          # Start-Process -Wait tracks the child process tree to completion.
+          $installProcess = Start-Process `
+            -FilePath $installer `
+            -ArgumentList $installArgs `
+            -Wait `
+            -PassThru
+          $installExit = $installProcess.ExitCode
+          Write-Host "CUDA installer exit code: $installExit"
+
+          if (Test-Path $logDir) {
+            Copy-Item -Path (Join-Path $logDir "*") -Destination $diagDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          $cudaRootCandidates = @(
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4",
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+          )
+          $treePath = Join-Path $diagDir "cuda_install_tree.txt"
+          foreach ($candidate in $cudaRootCandidates) {
+            if (Test-Path $candidate) {
+              Write-Host "=== Found CUDA path: $candidate ==="
+              Get-ChildItem $candidate -ErrorAction SilentlyContinue | Format-Table Name, Mode, Length | Out-String | Tee-Object -FilePath $treePath -Append | Write-Host
+              if (Test-Path (Join-Path $candidate "bin")) {
+                Get-ChildItem (Join-Path $candidate "bin") -ErrorAction SilentlyContinue |
+                  Select-Object -First 40 Name |
+                  Format-Table | Out-String | Tee-Object -FilePath $treePath -Append | Write-Host
+              }
+            } else {
+              Write-Host "Missing candidate path: $candidate"
+            }
+          }
+
+          function Show-InstallerLogTail {
+            Write-Host "=== Installer log tail (if any) ==="
+            Get-ChildItem $diagDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "---- $($_.Name) ($($_.Length) bytes) ----"
+              Get-Content $_.FullName -Tail 80 -ErrorAction SilentlyContinue
+            }
+          }
+
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+          $nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
+          $cicc = Join-Path $cudaRoot "nvvm\bin\cicc.exe"
+          if ($null -eq $installExit) {
+            Show-InstallerLogTail
+            Write-Error "CUDA installer did not return an exit code (see uploaded woa-cuda-diagnostics artifact)"
+            exit 1
+          }
+          # NVIDIA exit code 1 means success with a reboot requested. A reboot
+          # is unnecessary for compiling, so accept it if nvcc was installed.
+          if ($installExit -notin 0, 1) {
+            Show-InstallerLogTail
+            Write-Error "CUDA installer failed with exit code $installExit (see uploaded woa-cuda-diagnostics artifact)"
+            exit $installExit
+          }
+          if (-not (Test-Path $nvcc)) {
+            Show-InstallerLogTail
+            Write-Error "nvcc not found under $cudaRoot after install (see uploaded woa-cuda-diagnostics artifact)"
+            Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -ErrorAction SilentlyContinue
+            exit 1
+          }
+          if (-not (Test-Path $cicc)) {
+            Show-InstallerLogTail
+            Write-Error "NVVM compiler cicc not found under $cudaRoot after install (see uploaded woa-cuda-diagnostics artifact)"
+            exit 1
+          }
+
+          echo "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_HOME=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_PATH_V13_4=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Upload WoA CUDA install diagnostics
+        if: always() && steps.install-cuda.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: woa-cuda-diagnostics
+          path: ${{ runner.temp }}/woa_cuda_diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Set compiler-cache and CMake environment
+        shell: pwsh
+        run: |
+          echo "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "COMFY_CUDA_COMPILER_LAUNCHER=ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "COMFY_CXX_COMPILER_LAUNCHER=ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_DIR=$env:GITHUB_WORKSPACE\.ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_COMPILERCHECK=content" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify CUDA installation
+        shell: bash
+        run: |
+          set -x
+          echo "CUDA_HOME: $CUDA_HOME"
+          echo "CUDA_PATH: $CUDA_PATH"
+          echo "PATH: $PATH"
+          which nvcc || true
+          nvcc --version
+          ls -la "$CUDA_PATH" || true
+          ls -la "$CUDA_PATH/bin" | head -50 || true
+          ls -la "$CUDA_PATH/lib" || ls -la "$CUDA_PATH/lib/x64" || true
+
+      - name: Setup MSVC (ARM64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create python3.lib for stable ABI
+        shell: pwsh
+        run: |
+          # Create python3.lib for stable ABI support (cp312-abi3 wheel)
+          $pythonDir = Split-Path -Parent (Get-Command python).Source
+          $libsDir = Join-Path $pythonDir "libs"
+          $pythonLib = Get-ChildItem -Path $libsDir -Filter "python3*.lib" | Where-Object { $_.Name -match "python3\d+\.lib" } | Select-Object -First 1
+
+          if ($pythonLib) {
+            $python3Lib = Join-Path $libsDir "python3.lib"
+            if (-not (Test-Path $python3Lib)) {
+              Copy-Item -Path $pythonLib.FullName -Destination $python3Lib
+              Write-Host "Created python3.lib for stable ABI"
+            }
+          } else {
+            Write-Error "Could not find python3XX.lib"
+            exit 1
+          }
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.27.0"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install build setuptools wheel nanobind
+          python -c "import sys, platform; print(sys.version); print(platform.platform()); print(platform.machine())"
+
+      - name: Build CUDA abi3 wheel
+        env:
+          COMFY_CUDA_ARCHS: "120f"
+        shell: bash
+        run: |
+          set -x
+          # Python 3.12 produces the cp312-abi3 wheel (covers 3.12+).
+          # WoA / RTX Spark targets Blackwell (SM 120). Keep the arch set narrow
+          # so the 4-core windows-11-arm runners stay within CI time budgets.
+          python setup.py bdist_wheel -v
+
+      - name: Report compiler-cache statistics
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-Command ccache -ErrorAction SilentlyContinue) {
+            ccache --show-stats
+          } else {
+            Write-Host "ccache not available"
+          }
+
+      - name: List built wheels
+        shell: bash
+        run: |
+          ls -lh dist/
+          echo "Built wheels:"
+          ls -1 dist/*.whl
+          python - <<'PY'
+          from pathlib import Path
+          for p in sorted(Path("dist").glob("*.whl")):
+              print(f"{p.name}: {p.stat().st_size} bytes")
+          PY
+
+      - name: Upload Windows ARM abi3 wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-arm-cuda
+          path: dist/*.whl
+          if-no-files-found: error
+
+  test_windows_arm:
+    name: Test on Windows ARM (abi3)
+    needs: build_wheels_windows_arm
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download Windows ARM abi3 wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-arm-cuda
+          path: dist/
+
+      - name: Install wheel and test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Native win_arm64 CPU wheels from the PyTorch CPU index
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Install the CUDA win_arm64 abi3 wheel (CUDA tests skip without a GPU)
+          pip install dist/*.whl
+          pip install pytest ruff
+
+      - name: Ruff check
+        shell: bash
+        run: |
+          ruff check .
+
+      - name: Run tests
+        shell: bash
+        run: |
+          # Run all tests - conftest handles backend availability
+          # Tests requiring CUDA will be skipped on CPU-only runners
+          python -m pytest tests/ -v --tb=short
+
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels_linux, build_wheels_linux_arm64, build_wheels_windows, build_wheels_windows_arm, test_linux, test_windows, test_windows_arm]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+
+    steps:
+      - name: Download Linux CUDA+HIP wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-cuda-hip
+          path: dist/
+
+      - name: Download Linux ARM64 CUDA wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-arm64-cuda
+          path: dist/
+
+      - name: Download Windows CUDA+HIP wheel (3.10)
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-cuda-hip-3.10
+          path: dist/
+
+      - name: Download Windows CUDA+HIP wheel (3.11)
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-cuda-hip-3.11
+          path: dist/
+
+      - name: Download Windows CUDA+HIP wheel (3.12)
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-cuda-hip-3.12
+          path: dist/
+
+      - name: Download Windows ARM CUDA abi3 wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-arm-cuda
+          path: dist/
+
+      - name: Download CPU-only wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-cpu-only
+          path: dist/
+
+      - name: List wheels to publish
+        run: |
+          echo "Wheels to publish:"
+          ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true
+          verbose: true

@@ -1,0 +1,1911 @@
+diff --git a/comfy_kitchen/backends/hip/CMakeLists.txt b/comfy_kitchen/backends/hip/CMakeLists.txt
+index 7a580c3..9a9a50a 100644
+--- a/comfy_kitchen/backends/hip/CMakeLists.txt
++++ b/comfy_kitchen/backends/hip/CMakeLists.txt
+@@ -29,10 +29,12 @@ function(_ck_read_arch_group output group_name)
+ endfunction()
+ 
+ _ck_read_arch_group(COMFY_HIP_ELEMENTWISE_ARCHS elementwise_only)
++_ck_read_arch_group(COMFY_HIP_MMAC_GFX9_ARCHS mmac_gfx9)
+ _ck_read_arch_group(COMFY_HIP_WMMA_GFX11_ARCHS wmma_gfx11)
+ _ck_read_arch_group(COMFY_HIP_WMMA_GFX12_ARCHS wmma_gfx12)
+ set(COMFY_HIP_SUPPORTED_ARCHS
+     ${COMFY_HIP_ELEMENTWISE_ARCHS}
++    ${COMFY_HIP_MMAC_GFX9_ARCHS}
+     ${COMFY_HIP_WMMA_GFX11_ARCHS}
+     ${COMFY_HIP_WMMA_GFX12_ARCHS}
+ )
+@@ -69,6 +71,7 @@ endfunction()
+ 
+ _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
+ _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
++_ck_make_arch_condition(COMFY_HIP_GFX9_CONDITION ${COMFY_HIP_MMAC_GFX9_ARCHS})
+ set(_CK_HIP_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+ file(MAKE_DIRECTORY "${_CK_HIP_GENERATED_INCLUDE_DIR}")
+ configure_file(
+@@ -200,6 +203,34 @@ target_compile_options(comfy_kitchen_hip_kernels PRIVATE
+     $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
+     $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>
+ )
++
++# The Hygon v_mmac_* matrix builtins need their instruction-set features enabled.
++# The i8/b16 family needs mmop2-insts; the i4 family needs mmop3-insts and clang
++# rejects that builtin without it, on gfx928 included. gfx928 has mmop2 on by
++# default, gfx906/gfx938 do not. Added only when a gfx9 target is in the build, so
++# an RDNA-only build never sees the flags. The per-arch device passes that do not
++# know a feature just warn and ignore it; COMFY_MMA_GFX9 is undefined there, so no
++# mmac code is generated for them either way.
++#
++# Each feature is its own -target-feature pair: clang does not split a
++# comma-separated list, it treats "+a,+b" as one unknown feature name.
++#
++# The pairs go in as SHELL: entries. CMake de-duplicates target_compile_options,
++# so four separate -Xclang/-target-feature tokens would collapse to one and leave
++# "+mmop2-insts" and "+mmop3-insts" on the command line as stray file arguments.
++# One SHELL: item per feature keeps every argument and stays unique.
++foreach(_arch IN LISTS COMFY_HIP_ARCHS)
++    if(_arch IN_LIST COMFY_HIP_MMAC_GFX9_ARCHS)
++        set(_CK_BUILDS_GFX9 TRUE)
++    endif()
++endforeach()
++if(_CK_BUILDS_GFX9)
++    message(STATUS "Enabling mmop2-insts and mmop3-insts for the Hygon DCU matrix core")
++    target_compile_options(comfy_kitchen_hip_kernels PRIVATE
++        "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-Xclang -target-feature -Xclang +mmop2-insts>"
++        "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-Xclang -target-feature -Xclang +mmop3-insts>"
++    )
++endif()
+ if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+     target_compile_options(
+         comfy_kitchen_hip_kernels PRIVATE
+diff --git a/comfy_kitchen/backends/hip/__init__.py b/comfy_kitchen/backends/hip/__init__.py
+index 8c72d20..fd124cd 100644
+--- a/comfy_kitchen/backends/hip/__init__.py
++++ b/comfy_kitchen/backends/hip/__init__.py
+@@ -1,13 +1,17 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+-"""HIP backend for AMD RDNA2, RDNA3/3.5 and RDNA4.
++"""HIP backend for AMD RDNA2, RDNA3/3.5 and RDNA4, and the Hygon DCU.
+ 
+-Every matmul is a WMMA kernel compiled from the sources in this directory; the
+-backend does not link or call hipBLAS/hipBLASLt.
++Every matmul is a matrix-core kernel compiled from the sources in this directory;
++the backend does not link or call hipBLAS/hipBLASLt.
+ 
+-RDNA3 (gfx11xx) and RDNA4 (gfx12xx) have matrix cores and get everything. Their
+-fragment layouts differ, and RDNA3 has no fp8 WMMA, so it widens fp8 to bf16;
+-see mma.h.
++RDNA3 (gfx11xx) and RDNA4 (gfx12xx) have AMD's WMMA matrix cores and get
++everything. Their fragment layouts differ, and RDNA3 has no fp8 WMMA, so it
++widens fp8 to bf16; see mma.h.
++
++The Hygon DCU (gfx906/gfx928/gfx938) is a different instruction family: wave64
++and Hygon's v_mmac_* rather than v_wmma_*. Its kernels have their own bodies and
++are ported one at a time; mma.h's gfx9 policy is the reference for the layouts.
+ 
+ RDNA2 (gfx103x) has no matrix cores. It runs the elementwise kernels (RoPE,
+ AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and
+@@ -169,24 +173,44 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
+     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
+ 
+ 
+-# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
+-# consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
+-# compiler-recognized target needs its WMMA policy reviewed before it is safe.
++# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do, and so does the Hygon DCU
++# family, whose matrix core is Hygon's v_mmac_* rather than RDNA's v_wmma_*. This
++# exact manifest is also consumed by setup.py and CMake. Never infer support from
++# a gfx prefix: a new compiler-recognized target needs its WMMA policy reviewed
++# before it is safe.
++#
++# Having matrix cores and having a ported kernel for them are two different
++# things. The RDNA targets share one policy shape, so one group covers every
++# matrix-core kernel there. The Hygon DCU is a different instruction family and
++# was ported one kernel at a time; every matrix-core kernel it gates now has a
++# gfx9 body, so it joins the GEMM capability the same way it already joined the
++# INT8 attention one.
+ _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
+ _ARCH_GROUPS = json.loads(
+     pathlib.Path(_ARCH_MANIFEST_PATH).read_text(encoding="utf-8")
+ )
+ _ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
++_ARCH_MMAC_GFX9 = frozenset(_ARCH_GROUPS["mmac_gfx9"])
+ _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
+ _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
+-_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
+-_ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
++# The AMD-WMMA families alone. A kernel whose only body is v_wmma_* runs on these
++# and nowhere else, which is what gates the ops the DCU has no ported body for.
++_ARCH_RDNA_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
++# The GEMMs and the other matrix-core kernels: RDNA3/3.5, RDNA4 and the Hygon
++# DCU, whose GEMM bodies are ported and verified (see mma.h's gfx9 policy).
++_ARCH_GEMM = _ARCH_RDNA_WMMA | _ARCH_MMAC_GFX9
++# The INT8 attention kernel, which is ported on all three families. The same set
++# today, kept separate because it is a distinct kernel gate that has been true of
++# the DCU for longer.
++_ARCH_INT8_ATTN = _ARCH_MMAC_GFX9 | _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
++_ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_GEMM
+ 
+ # The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
+ # or a scalar reduction and runs on any supported architecture. This set names the
+-# registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
+-# GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
+-# which gates on has_wmma() itself rather than through the registry.
++# registry-dispatched matrix-core ops so _build_constraints can drop them on
++# RDNA2, the one supported family with no matrix core; the fp8 GEMM is not among
++# them because it is reached through scaled_mm_v2's _hip_fp8_gemm, which gates on
++# has_wmma() itself rather than through the registry.
+ _WMMA_ONLY_OPS = frozenset({
+     "fp16_conv3d",
+     "fp16_linear",
+@@ -198,6 +222,18 @@ _WMMA_ONLY_OPS = frozenset({
+     "w4a8_int8_linear",
+ })
+ 
++# The subset of _WMMA_ONLY_OPS whose only kernel body is AMD WMMA (v_wmma_*). The
++# Hygon DCU has a matrix core, so has_wmma() is true there, but these bodies were
++# never ported to it: they would run an RDNA kernel against the DCU's wave size and
++# fragment layout. Dropping them routes those ops to triton/eager while the ported
++# kernels still dispatch to HIP. fp16_conv3d/fp16_linear are the gemm_wmma fp16
++# path and sol_attn is the Sol-Attention family; the DCU has neither.
++_RDNA_WMMA_ONLY_OPS = frozenset({
++    "fp16_conv3d",
++    "fp16_linear",
++    "sol_attn",
++})
++
+ 
+ def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
+     """Why the backend must not register for this set of devices, or None if it may.
+@@ -216,13 +252,34 @@ def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
+ 
+ 
+ def _has_wmma(arches: Sequence[str | None]) -> bool:
+-    """Whether every visible device has matrix cores.
++    """Whether every visible device has a ported matrix-core kernel.
+ 
+     Registration is per-process while kernels launch on the tensor's own device, so
+     the capability set has to be the intersection over the visible devices: one
+     RDNA2 card in an otherwise RDNA4 box means no GEMM is safe to advertise.
+     """
+-    return bool(arches) and all(a in _ARCH_WMMA for a in arches)
++    return bool(arches) and all(a in _ARCH_GEMM for a in arches)
++
++
++def _has_rdna_wmma(arches: Sequence[str | None]) -> bool:
++    """Whether every visible device is an AMD-WMMA target.
++
++    True only when the AMD WMMA kernels -- the fp16 gemm_wmma path and the
++    Sol-Attention family -- are the ones that would run. The Hygon DCU has a
++    matrix core but no ported body for those, so this is strictly narrower than
++    _has_wmma() and is what gates them.
++    """
++    return bool(arches) and all(a in _ARCH_RDNA_WMMA for a in arches)
++
++
++def _has_int8_attn(arches: Sequence[str | None]) -> bool:
++    """Whether every visible device can run the INT8 attention kernel.
++
++    The same set as _has_wmma today, but kept separate: the Hygon DCU had this
++    kernel long before its GEMMs were ported, and the two gates are allowed to
++    drift apart again if a future kernel lands on one family first.
++    """
++    return bool(arches) and all(a in _ARCH_INT8_ATTN for a in arches)
+ 
+ 
+ def is_available() -> bool:
+@@ -230,7 +287,8 @@ def is_available() -> bool:
+ 
+ 
+ def has_wmma() -> bool:
+-    """Whether the GEMM kernels can run: every visible device has matrix cores.
++    """Whether the matrix-core GEMM kernels can run: every visible device has a
++    ported matrix core, AMD WMMA or Hygon v_mmac_*.
+ 
+     is_available() is true on RDNA2 as well, where only the elementwise kernels
+     exist, so callers that reach a GEMM without going through the registry (see
+@@ -2330,7 +2388,7 @@ def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
+ # Registration
+ # ---------------------------------------------------------------------------
+ 
+-def _build_constraints(has_wmma: bool = True) -> dict:
++def _build_constraints(has_wmma: bool = True, has_rdna_wmma: bool = True) -> dict:
+     from comfy_kitchen.constraints import (
+         DivisibleBy,
+         ExactDims,
+@@ -2712,6 +2770,11 @@ def _build_constraints(has_wmma: bool = True) -> dict:
+         # advertised. Dropping them here routes those ops to triton/eager while the
+         # elementwise kernels below still dispatch to HIP.
+         constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
++    elif not has_rdna_wmma:
++        # A DCU-only box: has_wmma() is true because the ported matrix-core kernels
++        # run, but the AMD-WMMA-only ops have no body here and must not be
++        # advertised either. Everything else in _WMMA_ONLY_OPS is ported.
++        constraints = {k: v for k, v in constraints.items() if k not in _RDNA_WMMA_ONLY_OPS}
+ 
+     return constraints
+ 
+@@ -2749,9 +2812,16 @@ def int8_attention_is_available() -> bool:
+     """Whether the INT8 attention kernels can run here.
+ 
+     Stricter than is_available(): the kernel is built on the matrix cores, so
+-    RDNA2 declines it the way it declines the GEMMs.
++    RDNA2 declines it the way it declines the GEMMs. Looser than has_wmma(): the
++    Hygon DCU port covers the attention without covering the GEMMs, so gating on
++    has_wmma() would hide a kernel that is there.
+     """
+-    return has_wmma()
++    arches = _visible_gfx_arches()
++    return (
++        _EXT_AVAILABLE
++        and _unsupported_arch_reason(arches) is None
++        and _has_int8_attn(arches)
++    )
+ 
+ 
+ def flash_attention_decode_is_available() -> bool:
+@@ -2786,10 +2856,13 @@ def gated_delta_decode_is_available(key_head_dim: int = 128, value_head_dim: int
+     """Whether the fused DeltaNet decode kernels can run here for these head dims.
+ 
+     The kernels use no matrix cores, but they do use bf16 and fp16 arithmetic
+-    throughout, so they draw the line where has_wmma() does, as the decode
+-    attention kernel next door does.
++    throughout, so they need a target with the fp16 path, as the decode attention
++    kernel next door does. They are also laid out for a wave of 32 -- one wave
++    covers 32 value columns and the partition reduction indexes by kWave -- so they
++    decline on the Hygon DCU, whose waves are 64 wide. _has_rdna_wmma() is exactly
++    "every visible device is a wave32 AMD-WMMA target".
+     """
+-    if not has_wmma() or not hasattr(_C, "gated_delta_decode_fused"):
++    if not _has_rdna_wmma(_visible_gfx_arches()) or not hasattr(_C, "gated_delta_decode_fused"):
+         return False
+     if key_head_dim != _DELTA_KEY_DIM or value_head_dim <= 0 or value_head_dim > 512:
+         return False
+@@ -3070,7 +3143,7 @@ def _register():
+     registry.register(
+         name="hip",
+         module=sys.modules[__name__],
+-        capabilities=_build_constraints(has_wmma),
++        capabilities=_build_constraints(has_wmma, _has_rdna_wmma(arches)),
+     )
+     logger.debug(
+         "registered HIP backend for %s (%s)",
+diff --git a/comfy_kitchen/backends/hip/architecture_config.h.in b/comfy_kitchen/backends/hip/architecture_config.h.in
+index 6e2aa63..cd4cbac 100644
+--- a/comfy_kitchen/backends/hip/architecture_config.h.in
++++ b/comfy_kitchen/backends/hip/architecture_config.h.in
+@@ -5,8 +5,13 @@
+ #define COMFY_MMA_GFX12 1
+ #elif @COMFY_HIP_GFX11_CONDITION@
+ #define COMFY_MMA_GFX11 1
++#elif @COMFY_HIP_GFX9_CONDITION@
++// Hygon DCU (gfx906..gfx938): wave64, Hygon v_mmac_* matrix core. Kept last
++// because a target that appeared in two groups would otherwise pick the RDNA
++// policy; the manifest forbids that, this is belt and braces.
++#define COMFY_MMA_GFX9 1
+ #endif
+ 
+-#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX11)
++#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX11) || defined(COMFY_MMA_GFX9)
+ #define COMFY_HAS_WMMA 1
+ #endif
+diff --git a/comfy_kitchen/backends/hip/architectures.json b/comfy_kitchen/backends/hip/architectures.json
+index 6707011..6e731da 100644
+--- a/comfy_kitchen/backends/hip/architectures.json
++++ b/comfy_kitchen/backends/hip/architectures.json
+@@ -8,6 +8,11 @@
+     "gfx1035",
+     "gfx1036"
+   ],
++  "mmac_gfx9": [
++    "gfx906",
++    "gfx928",
++    "gfx938"
++  ],
+   "wmma_gfx11": [
+     "gfx1100",
+     "gfx1101",
+diff --git a/comfy_kitchen/backends/hip/gemm_wmma.h b/comfy_kitchen/backends/hip/gemm_wmma.h
+index 7944233..faf01b0 100644
+--- a/comfy_kitchen/backends/hip/gemm_wmma.h
++++ b/comfy_kitchen/backends/hip/gemm_wmma.h
+@@ -231,17 +231,19 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
+ 
+     // Row-major writeback: the TN column tiles of one accumulator row cover
+     // TN*16 consecutive columns, keeping the stores of an iteration contiguous.
+-    const int col_lane = acc_col(lane);
++    // The element count and the row/column mapping are the policy's: wave32 RDNA
++    // holds eight elements with a fixed column, the wave64 DCU four with the
++    // column moving with `e`. See Mma::kAccElems / acc_row / acc_col in mma.h.
+     #pragma unroll
+     for (int i = 0; i < TM; ++i) {
+         #pragma unroll
+-        for (int e = 0; e < 8; ++e) {
++        for (int e = 0; e < Mma::kAccElems; ++e) {
+             const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+             if (r >= M) continue;
+             OutT* crow = C + static_cast<int64_t>(r) * ldc;
+             #pragma unroll
+             for (int j = 0; j < TN; ++j) {
+-                const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
++                const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane, e);
+                 if (col >= N) continue;
+                 crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
+             }
+@@ -289,6 +291,16 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
+ 
+     const int wgps = device_wgp_count();
+ 
++    // A wave is one warp and owns one 16x16 tile, so the warp grid (WARPS_M x
++    // WARPS_N) is the same on both families; only lanes-per-wave differs (wave32
++    // on RDNA, wave64 on the Hygon DCU). The block size is therefore the warp
++    // count times the *device's* wave size: kWave is a device-pass constant and
++    // reads wave32 in this host pass even for a gfx9 build. See device_wave_size.
++    const int wave = device_wave_size();
++    const int kThreads44 = 4 * 4 * wave;
++    const int kThreads42 = 4 * 2 * wave;
++    const int kThreads22 = 2 * 2 * wave;
++
+     // Zero padding the block count cannot see: at M <= 64 the 128-row tile is at
+     // least half empty, and the finer 64x64 grid recovers the wasted MMAs.
+     const bool skinny = (M <= 64 || N <= 64);
+@@ -301,27 +313,27 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
+             // the 16-wave grid hides latency within a block instead.
+             if (blocks_128 <= 4 * wgps) {
+                 gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+-                    <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++                    <<<grid, kThreads44, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+             } else {
+                 gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
+-                    <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++                    <<<grid, kThreads42, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+             }
+         } else {
+             constexpr int BM = 128, BN = 128, BKB = 64;
+             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+             gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
+-                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++                <<<grid, kThreads42, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+         }
+     } else if (kbytes >= 2048) {
+         constexpr int BM = 64, BN = 64, BKB = 128;
+         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+         gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++            <<<grid, kThreads22, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+     } else {
+         constexpr int BM = 64, BN = 64, BKB = 64;
+         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+         gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++            <<<grid, kThreads22, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+     }
+ }
+ 
+diff --git a/comfy_kitchen/backends/hip/mma.h b/comfy_kitchen/backends/hip/mma.h
+index 73e807a..b64d737 100644
+--- a/comfy_kitchen/backends/hip/mma.h
++++ b/comfy_kitchen/backends/hip/mma.h
+@@ -28,6 +28,7 @@
+ 
+ #include <hip/hip_runtime.h>
+ 
++#include <atomic>
+ #include <cstdint>
+ 
+ #include "architecture_config.h"
+@@ -41,13 +42,50 @@ typedef int int32_t_v4 __attribute__((ext_vector_type(4)));
+ typedef int32_t_v2 v2i;
+ typedef int32_t_v4 v4i;
+ typedef int v8i __attribute__((ext_vector_type(8)));
++typedef float v4f __attribute__((ext_vector_type(4)));
+ typedef float v8f __attribute__((ext_vector_type(8)));
+ typedef __bf16 v8bf __attribute__((ext_vector_type(8)));
+ typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
++typedef __bf16 v4bf __attribute__((ext_vector_type(4)));
++typedef _Float16 v4h __attribute__((ext_vector_type(4)));
+ typedef _Float16 v8h __attribute__((ext_vector_type(8)));
+ typedef _Float16 v16h __attribute__((ext_vector_type(16)));
+ 
++// RDNA (gfx10/11/12) issues one MMA per wave32. The Hygon DCU (gfx9 family,
++// gfx906..gfx938) is wave64 and issues v_mmac_*, so kWave differs per family and
++// every lane-derived index in the kernels has to follow it.
++#if defined(COMFY_MMA_GFX9)
++constexpr int kWave = 64;
++#else
+ constexpr int kWave = 32;
++#endif
++
++// The runtime wave size of the device a launch will run on.
++//
++// kWave above is a *device-pass* constant: __gfx906__/__gfx928__/... is defined
++// only while compiling device code, so the host pass always falls through to the
++// wave32 value -- even in a gfx928-only build. Every host-side launch
++// configuration (block dimensions, the partners of a kernel's __launch_bounds__)
++// has to match the wave the kernel will actually run on, and a fat binary can
++// hold both wave32 and wave64 images, so the size comes from the device rather
++// than from kWave. Cached per ordinal; the fallback only mis-sizes a launch the
++// driver would reject, it cannot change a result.
++inline int device_wave_size() {
++    constexpr int kMaxDevices = 16;
++    // A kernel can be launched from several host threads at once. Racing threads
++    // write the same value and nothing is published through the cache, so relaxed.
++    static std::atomic<int> cache[kMaxDevices] = {};
++    int dev = 0;
++    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return 32;
++    int n = cache[dev].load(std::memory_order_relaxed);
++    if (n == 0) {
++        if (hipDeviceGetAttribute(&n, hipDeviceAttributeWarpSize, dev) != hipSuccess || n <= 0) {
++            n = 32;
++        }
++        cache[dev].store(n, std::memory_order_relaxed);
++    }
++    return n;
++}
+ 
+ // architecture_config.h is generated from architectures.json. __gfx*__ is
+ // defined only in device passes; the host pass falls through to the stubs below.
+@@ -67,11 +105,14 @@ __forceinline__ __device__ T wave_reduce_sum(T v) {
+ }
+ 
+ // Four int8 products accumulated into a 32-bit sum, the operands packed one per
+-// byte. RDNA3/4 spell it v_dot4_i32_iu8 with both operands marked signed; RDNA2
+-// has the older v_dot4c_i32_i8 under a different builtin, and the host pass has
+-// neither, so both fall back to the arithmetic the instruction performs.
++// byte. RDNA3/4 spell it v_dot4_i32_iu8 with both operands signed; RDNA2 has the
++// older v_dot4c_i32_i8 under a different builtin. The Hygon DCU does have the
++// instruction family, but clang gates __builtin_amdgcn_sudot4 behind the
++// +dot8-insts feature, which the gfx9 targets do not enable here, so the gfx9
++// path takes the arithmetic fallback too. The instruction count is the only
++// difference; the sum is the same int32.
+ __forceinline__ __device__ int dot4_i8(int a, int b, int c) {
+-#if defined(COMFY_HAS_WMMA)
++#if defined(COMFY_HAS_WMMA) && !defined(COMFY_MMA_GFX9)
+     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+ #else
+     #pragma unroll
+@@ -91,12 +132,49 @@ __forceinline__ __device__ int frag_row(int lane) { return lane % 16; }
+ // is row 2e for the low half-wave and 2e + 1 for the high one, so consecutive
+ // elements are two rows apart. Both are 32-bit accumulators (v8f/v8i), so neither
+ // has the padded-acc read the 16-bit gfx11 accumulators need.
+-#if defined(COMFY_MMA_GFX11)
++//
++// The Hygon DCU (gfx9) transposes the two: a lane owns one row and four columns
++// four apart, so the column is a function of `e` and there is no one-argument
++// answer. gfx906..gfx938 register layout, measured on gfx928 (0/256 mismatch):
++//   A lane l, byte p -> A[l % 16][8 * (l / 16) + p]
++//   B lane l, byte p -> B[8 * (l / 16) + p][l % 16]
++//   C lane l, elem i -> C[l % 16][4 * i + (l / 16)]
++//
++// Both gfx11/gfx12 are 8-element (v8) accumulators with a fixed column; gfx9 is a
++// 4-element (v4) one whose column moves with `e`. Consumers that walk all the
++// accumulator elements must therefore ask the policy for both the element count
++// (Mma::kAccElems) and the row/column, not assume eight or a fixed column.
++#if defined(COMFY_MMA_GFX9)
++__forceinline__ __device__ int acc_row(int lane, int) { return lane % 16; }
++__forceinline__ __device__ int acc_col(int lane, int e) { return 4 * e + (lane / 16); }
++// Legacy single-argument form so kernels that have not been ported to the gfx9
++// layout still compile. It is not the gfx9 column: do not read results with it.
++__forceinline__ __device__ int acc_col(int lane) { return lane / 16; }
++#elif defined(COMFY_MMA_GFX11)
+ __forceinline__ __device__ int acc_row(int lane, int e) { return 2 * e + (lane / 16); }
++__forceinline__ __device__ int acc_col(int lane, int) { return lane % 16; }
++__forceinline__ __device__ int acc_col(int lane) { return lane % 16; }
+ #else
+ __forceinline__ __device__ int acc_row(int lane, int e) { return e + 8 * (lane / 16); }
+-#endif
++__forceinline__ __device__ int acc_col(int lane, int) { return lane % 16; }
+ __forceinline__ __device__ int acc_col(int lane) { return lane % 16; }
++#endif
++
++// How many distinct accumulator *rows* one lane holds, and which slot a given
++// element belongs to. A row's softmax state (running max and denominator) lives
++// in one slot, so a consumer that keeps per-row state has to fold the elements
++// that share a slot together before reducing across lanes.
++//
++// On RDNA each of the eight accumulator elements is a different row, so the
++// mapping is the identity. On gfx9 all four of a lane's elements are columns of
++// the single row it owns (see acc_row/acc_col above), so they collapse to one.
++#if defined(COMFY_MMA_GFX9)
++constexpr int kAccRowsPerLane = 1;
++__forceinline__ __device__ constexpr int acc_row_slot(int) { return 0; }
++#else
++constexpr int kAccRowsPerLane = 8;
++__forceinline__ __device__ constexpr int acc_row_slot(int e) { return e; }
++#endif
+ 
+ // Bytes of a row that live `stride` apart in LDS. `row` is the lane's row (A) or
+ // column (B); `kbyte` is the byte offset within that row.
+@@ -166,6 +244,7 @@ struct MmaFp8 {
+     using Acc = v8f;
+     using Frag = v2i;
+     static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                 int lane) {
+         return load_frag_b64(lds, row, kbyte + 8 * (lane / 16), stride);
+@@ -181,6 +260,7 @@ struct MmaBf8 {
+     using Acc = v8f;
+     using Frag = v2i;
+     static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                 int lane) {
+         return load_frag_b64(lds, row, kbyte + 8 * (lane / 16), stride);
+@@ -196,6 +276,7 @@ struct MmaInt8 {
+     using Acc = v8i;
+     using Frag = v2i;
+     static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                 int lane) {
+         return load_frag_b64(lds, row, kbyte + 8 * (lane / 16), stride);
+@@ -224,10 +305,18 @@ struct MmaInt4 {
+     using Acc = v8i;
+     using Frag = v2i;
+     static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                 int lane) {
+         return load_frag_b64(lds, row, kbyte + 8 * (lane / 16), stride);
+     }
++    // The iu4 instruction takes A's signedness as an immediate, so the fragment
++    // bytes are the same either way; this exists only so the callers can name it
++    // on every policy. See the gfx9 policy for where it does differ.
++    static __forceinline__ __device__ Frag load_unsigned(const void* lds, int row, int kbyte,
++                                                         int stride, int lane) {
++        return load(lds, row, kbyte, stride, lane);
++    }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+         return __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, a, true, b, c, false);
+@@ -246,6 +335,7 @@ struct MmaBf16 {
+     using Frag = v8bf;
+     using Elem = __bf16;
+     static constexpr int kFragElems = 8;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ int frag_base(int lane) { return 8 * (lane / 16); }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+@@ -259,6 +349,7 @@ struct MmaF16 {
+     using Frag = v8h;
+     using Elem = _Float16;
+     static constexpr int kFragElems = 8;
++    static constexpr int kAccElems = 8;
+     // The GEMM core's byte-addressed view: 16 fp16 elements are 32 bytes.
+     static constexpr int kStepBytes = 32;
+     static __forceinline__ __device__ int frag_base(int lane) { return 8 * (lane / 16); }
+@@ -281,6 +372,7 @@ struct MmaFp8 {
+     using Acc = v8f;
+     using Frag = v16bf;
+     static constexpr int kStepBytes = 16;  // 16 fp8 bytes == K-step of 16
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                 int lane) {
+         return load_frag_fp8_as_bf16<false>(lds, row, kbyte, stride);
+@@ -296,6 +388,7 @@ struct MmaBf8 {
+     using Acc = v8f;
+     using Frag = v16bf;
+     static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                 int lane) {
+         return load_frag_fp8_as_bf16<true>(lds, row, kbyte, stride);
+@@ -311,6 +404,7 @@ struct MmaInt8 {
+     using Acc = v8i;
+     using Frag = v4i;  // whole K-step of 16 int8, duplicated across half-waves
+     static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                 int lane) {
+         return load_frag_b128(lds, row, kbyte, stride);
+@@ -336,10 +430,17 @@ struct MmaInt4 {
+     using Acc = v8i;
+     using Frag = v2i;  // K=16 nibbles == 8 bytes, whole step, duplicated
+     static constexpr int kStepBytes = 8;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                 int lane) {
+         return load_frag_b64(lds, row, kbyte, stride);
+     }
++    // Same fragment bytes: the iu4 instruction carries A's signedness as an
++    // immediate, so nothing changes here. See the gfx9 policy.
++    static __forceinline__ __device__ Frag load_unsigned(const void* lds, int row, int kbyte,
++                                                         int stride, int lane) {
++        return load(lds, row, kbyte, stride, lane);
++    }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+         return __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c, false);
+@@ -357,6 +458,7 @@ struct MmaBf16 {
+     using Frag = v16bf;
+     using Elem = __bf16;
+     static constexpr int kFragElems = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ int frag_base(int) { return 0; }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+@@ -370,6 +472,7 @@ struct MmaF16 {
+     using Frag = v16h;
+     using Elem = _Float16;
+     static constexpr int kFragElems = 16;
++    static constexpr int kAccElems = 8;
+     static constexpr int kStepBytes = 32;
+     static __forceinline__ __device__ int frag_base(int) { return 0; }
+     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+@@ -385,6 +488,210 @@ struct MmaF16 {
+     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+ };
+ 
++#elif defined(COMFY_MMA_GFX9)
++
++// ---------------------------------------------------------------------------
++// Hygon DCU matrix core, gfx906..gfx938, wave64.
++//
++// The instruction is Hygon's v_mmac_*, NOT AMD's v_mfma_*. The latter is what
++// clang emits for +mai-insts, but gfx928 hardware traps it as an illegal
++// instruction (measured: all five MFMA shapes VMFault); v_mmac_* runs, needs no
++// target feature, and is richer -- bf16, i8 with K=32 and i4 with K=64.
++//
++// Register layouts, measured on gfx928 with /tmp/hiprun/mmac_layout.hip
++// (0/256 mismatch against a CPU reference):
++//   A lane l, byte p -> A[l % 16][8 * (l / 16) + p]     (i8; 4 elements for bf16/f16)
++//   B lane l, byte p -> B[8 * (l / 16) + p][l % 16]
++//   C lane l, elem i -> C[l % 16][4 * i + (l / 16)]
++//
++// A is read straight out of a natural [row][K] tile: the eight bytes a lane owns
++// are contiguous in K, so they are one 8-byte load at the lane's row.
++//
++// The GEMM stages B the same natural way, as [N][K] rows of K. The hardware B
++// operand is [K][N], so lane l's byte p maps to Bs[l % 16][8 * (l / 16) + p] --
++// again eight contiguous bytes of one row, i.e. the same loader as A. (A caller
++// that instead stored B transposed as [K][N] would need the strided gather this
++// used to carry; no caller does.)
++//
++// gfx9 has no fp8 matrix instruction, so MmaFp8/MmaBf8 widen to bf16 exactly as
++// the gfx11 policy does.
++
++// One 8-byte fragment: 8 consecutive bytes of this lane's row, starting at the
++// lane's K slice. Used for both A and the naturally-staged B.
++__forceinline__ __device__ long load_frag_b64_a(const void* lds, int row, int kbyte, int stride,
++                                                int lane) {
++    const char* p = static_cast<const char*>(lds) + row * stride + kbyte + 8 * (lane / 16);
++    const int* q = reinterpret_cast<const int*>(p);
++    // kLdsPad can break 8-byte alignment, so this stays two 32-bit loads.
++    const uint64_t lo = static_cast<uint32_t>(q[0]);
++    const uint64_t hi = static_cast<uint32_t>(q[1]);
++    return static_cast<long>(lo | (hi << 32));
++}
++
++// Four fp8 bytes of a row -> the four bf16 of one gfx9 K-step slice. gfx9 has no
++// fp8 matrix instruction, so fp8 runs as bf16 exactly as the gfx11 policy does;
++// the widening is exact and both accumulate in f32.
++template <bool E5M2>
++__forceinline__ __device__ v4bf load_frag_fp8x4_as_bf16(const void* lds, int row, int kbyte,
++                                                        int stride, int lane) {
++    const uint8_t* p =
++        static_cast<const uint8_t*>(lds) + row * stride + kbyte + 4 * (lane / 16);
++    v4bf r;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        r[i] = static_cast<__bf16>(E5M2 ? bf8_to_float(p[i]) : fp8_to_float(p[i]));
++    }
++    return r;
++}
++
++struct MmaFp8 {
++    using Acc = v4f;
++    using Frag = v4bf;
++    static constexpr int kStepBytes = 16;  // 16 fp8 bytes == K-step of 16
++    static constexpr int kAccElems = 4;
++    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
++                                                int lane) {
++        return load_frag_fp8x4_as_bf16<false>(lds, row, kbyte, stride, lane);
++    }
++    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0}; }
++    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
++        return __builtin_amdgcn_mmac_f32_16x16x16bf16(a, b, c);
++    }
++    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
++};
++
++struct MmaBf8 : MmaFp8 {};
++
++struct MmaInt8 {
++    using Acc = v4i;
++    using Frag = long;  // 8 int8 of the K-step of 32, this lane's slice
++    static constexpr int kStepBytes = 32;  // K=32 per MMA
++    static constexpr int kAccElems = 4;
++    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
++                                                int lane) {
++        return load_frag_b64_a(lds, row, kbyte, stride, lane);
++    }
++    static __forceinline__ __device__ Frag load_aligned(const void* lds, int row, int kbyte,
++                                                        int stride, int lane) {
++        return load_frag_b64_a(lds, row, kbyte, stride, lane);
++    }
++    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0}; }
++    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
++        return __builtin_amdgcn_mmac_i32_16x16x32i8(a, b, c);
++    }
++    // Hygon exposes whole-operand signedness (i8/u8), not per-side. The attention
++    // kernel's unsigned P operand is the one that needs mma_ub; it maps to u8.
++    static __forceinline__ __device__ Acc mma_ua(Frag a, Frag b, Acc c) {
++        return __builtin_amdgcn_mmac_i32_16x16x32u8(a, b, c);
++    }
++    static __forceinline__ __device__ Acc mma_ub(Frag a, Frag b, Acc c) {
++        return __builtin_amdgcn_mmac_i32_16x16x32u8(a, b, c);
++    }
++    static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
++};
++
++// Hygon's int4 mmac is not usable: clang emits v_mmac_i32_16x16x64_i4 behind
++// +mmop3-insts, but the gfx928 silicon traps it as an illegal instruction
++// (measured; the u4 form and every feature combination trap too). Int4 therefore
++// runs as int8: each nibble is unpacked to a signed int8 in the fragment loader
++// and fed to the i8 MMA.
++//
++// One i4 MMA would consume K=64 nibbles; two i8 MMAs consume 32 each. kStepBytes
++// is therefore 16 packed bytes, not 32 -- the same K-per-MMA the gfx12 iu4 policy
++// has, so every caller's group arithmetic (kSvdGroupBytes / kStepBytes) is
++// unchanged. The instruction count doubles; the accumulated values are exact
++// either way, since both paths accumulate the same int32 dot product.
++__forceinline__ __device__ long load_frag_i4(const void* lds, int row, int kbyte, int stride,
++                                             int lane, bool sign_extend) {
++    // Four packed bytes hold this lane's eight nibbles: byte 4*(lane/16)+b carries
++    // nibbles 8*(lane/16)+2b and +1, low nibble of the byte first.
++    const uint8_t* p = static_cast<const uint8_t*>(lds) + row * stride + kbyte + 4 * (lane / 16);
++    uint64_t out = 0;
++#pragma unroll
++    for (int b = 0; b < 4; ++b) {
++        const int byte = p[b];
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int nib = h ? ((byte >> 4) & 0xF) : (byte & 0xF);
++            const int val = (sign_extend && nib > 7) ? nib - 16 : nib;
++            out |= static_cast<uint64_t>(static_cast<uint8_t>(static_cast<int8_t>(val)))
++                   << (8 * (2 * b + h));
++        }
++    }
++    return static_cast<long>(out);
++}
++
++struct MmaInt4 {
++    using Acc = v4i;
++    using Frag = long;  // 8 int8, this lane's slice of a K=32 step
++    // 16 packed int4 bytes == 32 nibbles == the i8 MMA's K. See above.
++    static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 4;
++    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
++                                                int lane) {
++        return load_frag_i4(lds, row, kbyte, stride, lane, /*sign_extend=*/true);
++    }
++    // The A operand when the activations are unsigned int4 (0..15). The i8 MMA
++    // reads A as signed, but 0..15 is positive in both readings, so leaving the
++    // nibbles unextended is exactly an unsigned A.
++    static __forceinline__ __device__ Frag load_unsigned(const void* lds, int row, int kbyte,
++                                                         int stride, int lane) {
++        return load_frag_i4(lds, row, kbyte, stride, lane, /*sign_extend=*/false);
++    }
++    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0}; }
++    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
++        return __builtin_amdgcn_mmac_i32_16x16x32i8(a, b, c);
++    }
++    // Same instruction: the unsigned A already came out of load_unsigned, and B
++    // (the weight) is signed in every caller.
++    static __forceinline__ __device__ Acc mma_ua(Frag a, Frag b, Acc c) {
++        return __builtin_amdgcn_mmac_i32_16x16x32i8(a, b, c);
++    }
++    static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
++};
++
++// 16-bit operands. A lane holds four contiguous elements at K offset
++// 4 * (lane / 16); B's four are a row apart, same as the int8 case.
++struct MmaBf16 {
++    using Acc = v4f;
++    using Frag = v4bf;
++    using Elem = __bf16;
++    static constexpr int kFragElems = 4;
++    static constexpr int kAccElems = 4;
++    static __forceinline__ __device__ int frag_base(int lane) { return 4 * (lane / 16); }
++    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0}; }
++    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
++        return __builtin_amdgcn_mmac_f32_16x16x16bf16(a, b, c);
++    }
++    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
++};
++
++struct MmaF16 {
++    using Acc = v4f;
++    using Frag = v4h;
++    using Elem = _Float16;
++    static constexpr int kFragElems = 4;
++    static constexpr int kAccElems = 4;
++    // 16 fp16 elements are one K-step of the byte-addressed GEMM core.
++    static constexpr int kStepBytes = 32;
++    static __forceinline__ __device__ int frag_base(int lane) { return 4 * (lane / 16); }
++    // The fp16 gemm_wmma path is not ported to the DCU: no kernel here uses this
++    // loader, and gemm_fp16/conv3d_fp16 are gated off on gfx9. It exists only so
++    // the translation units that instantiate launch_gemm_wmma<MmaF16> still
++    // compile. Trap rather than return a plausible wrong fragment, the way the
++    // no-matrix-core stub does. na3d's fp16 path uses load_frag_16bit directly and
++    // is unaffected.
++    static __forceinline__ __device__ Frag load(const void*, int, int, int, int) {
++        __builtin_trap();
++        return Frag{};
++    }
++    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0}; }
++    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
++        return __builtin_amdgcn_mmac_f32_16x16x16f16(a, b, c);
++    }
++    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
++};
++
+ #else
+ 
+ // No matrix cores (RDNA2 and older) and the host pass. The GEMM kernels are
+@@ -399,6 +706,7 @@ struct MmaFp8 {
+     using Acc = v8f;
+     using Frag = v2i;
+     static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
+@@ -411,6 +719,7 @@ struct MmaInt8 {
+     using Acc = v8i;
+     using Frag = v2i;
+     static constexpr int kStepBytes = 16;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Frag load_aligned(const void*, int, int, int, int) {
+@@ -422,13 +731,18 @@ struct MmaInt8 {
+     static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
+ };
+ 
+-struct MmaInt4 : MmaInt8 {};
++struct MmaInt4 : MmaInt8 {
++    static __forceinline__ __device__ Frag load_unsigned(const void*, int, int, int, int) {
++        return Frag{};
++    }
++};
+ 
+ struct MmaBf16 {
+     using Acc = v8f;
+     using Frag = v8bf;
+     using Elem = __bf16;
+     static constexpr int kFragElems = 8;
++    static constexpr int kAccElems = 8;
+     static __forceinline__ __device__ int frag_base(int) { return 0; }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
+@@ -440,6 +754,7 @@ struct MmaF16 {
+     using Frag = v8h;
+     using Elem = _Float16;
+     static constexpr int kFragElems = 8;
++    static constexpr int kAccElems = 8;
+     static constexpr int kStepBytes = 32;
+     static __forceinline__ __device__ int frag_base(int) { return 0; }
+     static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
+diff --git a/comfy_kitchen/backends/hip/ops/convrot_w4a4.hip b/comfy_kitchen/backends/hip/ops/convrot_w4a4.hip
+index 25b1432..bae8232 100644
+--- a/comfy_kitchen/backends/hip/ops/convrot_w4a4.hip
++++ b/comfy_kitchen/backends/hip/ops/convrot_w4a4.hip
+@@ -33,21 +33,24 @@ template <typename OutT>
+ static void launch_w4a4(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
+                         EpiRowwise epi, hipStream_t stream) {
+     const int kbytes = K / 2;
++    // A block is one wave per 16x16 tile of the warp grid, and kWave reads wave32
++    // in this host pass even for a gfx9 build, so the size comes from the device.
++    const int wave = device_wave_size();
+     if (M >= 512 && N >= 128 && K > N) {
+         constexpr int BM = 256, BN = 128, BKB = 64;
+         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
+-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
++            <<<grid, 4 * 2 * wave, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
+     } else if (M >= 96 && N >= 96) {
+         constexpr int BM = 128, BN = 128, BKB = 64;
+         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 2, 4>
+-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
++            <<<grid, 4 * 2 * wave, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
+     } else {
+         constexpr int BM = 64, BN = 64, BKB = 64;
+         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 2, 2, 2, 2>
+-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
++            <<<grid, 2 * 2 * wave, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
+     }
+ }
+ 
+diff --git a/comfy_kitchen/backends/hip/ops/flash_decode.hip b/comfy_kitchen/backends/hip/ops/flash_decode.hip
+index e7769f2..421c8f2 100644
+--- a/comfy_kitchen/backends/hip/ops/flash_decode.hip
++++ b/comfy_kitchen/backends/hip/ops/flash_decode.hip
+@@ -17,6 +17,7 @@
+ 
+ #include <cfloat>
+ #include <cstdint>
++#include <stdexcept>
+ 
+ #include "../launchers.h"
+ #include "../mma.h"
+@@ -28,10 +29,10 @@ constexpr int kHeadDim = 128;
+ constexpr int kDimPerLane = kHeadDim / kWave;
+ constexpr int kCombineThreads = kHeadDim;
+ 
+-// wave_sum below is a fixed wave32 DPP sequence, and four elements per lane is
+-// what makes the head dimension divide evenly.
+-static_assert(kWave == 32, "the reduction and the lane layout assume wave32");
+-static_assert(kDimPerLane == 4, "a lane holds four elements of the head dim");
++// The head dimension is split evenly across the wave and closed with a full-wave
++// reduction, so it has to divide by the wave size: four elements per lane at
++// wave32 (RDNA), two at wave64 (the Hygon DCU).
++static_assert(kHeadDim % kWave == 0, "the head dim must divide evenly across the wave");
+ 
+ // One wave per (batch, head, split) leaves too few waves to cover a cache miss,
+ // and the split count is the caller's and capped. The waves of a block share a
+@@ -71,6 +72,10 @@ __forceinline__ __device__ v4f load_bf16x4(const __bf16* p) {
+ // __shfl_xor to ds_bpermute plus an LDS wait, five times per key per group,
+ // which dominates once the group tile is wide. Bit-identical to that butterfly:
+ // each step equalizes a wider span, so the next mirror acts as an xor swap.
++//
++// The DPP sequence below is a fixed wave32 one and gfx9 has no equivalent, so
++// there the portable butterfly is used instead -- slower, but the same sum.
++#if !defined(COMFY_MMA_GFX9)
+ template <int Ctrl>
+ __forceinline__ __device__ float dpp_add(float v) {
+     const int bits = __builtin_bit_cast(int, v);
+@@ -87,6 +92,9 @@ __forceinline__ __device__ float wave_sum(float v) {
+                    float, __builtin_amdgcn_permlanex16(bits, bits, 0x76543210, 0xfedcba98, false,
+                                                        false));
+ }
++#else
++__forceinline__ __device__ float wave_sum(float v) { return wave_reduce_sum(v); }
++#endif
+ 
+ // Splits partition [0, length). A split past the end still runs the epilogue:
+ // the combine pass reads every slot and would otherwise read uninitialized
+@@ -304,9 +312,12 @@ void launch_typed(const void* q, const void* k, const void* v, const int* kv_len
+                   hipStream_t stream) {
+     const dim3 grid(query_length / GroupsPerPass, num_splits, batch * heads);
+     const int rows = batch * heads * query_length;
++    // kWavesPerBlock waves, and kWave reads wave32 in this host pass even for a
++    // gfx9 build, so the block size comes from the device.
++    const int threads = kWavesPerBlock * device_wave_size();
+     const bool split = num_splits > 1;
+     if (split) {
+-        flash_decode_kernel<GroupsPerPass, true><<<grid, kBlockThreads, 0, stream>>>(
++        flash_decode_kernel<GroupsPerPass, true><<<grid, threads, 0, stream>>>(
+             static_cast<const __bf16*>(q), static_cast<const __bf16*>(k),
+             static_cast<const __bf16*>(v), kv_lengths, static_cast<__bf16*>(out), softmax_lse,
+             out_accum, lse_accum, rows, query_length, heads, kv_capacity, num_splits,
+@@ -316,7 +327,7 @@ void launch_typed(const void* q, const void* k, const void* v, const int* kv_len
+             out_accum, lse_accum, static_cast<__bf16*>(out), softmax_lse, num_splits, rows,
+             query_length, heads, q_batch_stride, q_row_stride, q_head_stride);
+     } else {
+-        flash_decode_kernel<GroupsPerPass, false><<<grid, kBlockThreads, 0, stream>>>(
++        flash_decode_kernel<GroupsPerPass, false><<<grid, threads, 0, stream>>>(
+             static_cast<const __bf16*>(q), static_cast<const __bf16*>(k),
+             static_cast<const __bf16*>(v), kv_lengths, static_cast<__bf16*>(out), softmax_lse,
+             out_accum, lse_accum, rows, query_length, heads, kv_capacity, num_splits,
+diff --git a/comfy_kitchen/backends/hip/ops/gemm_fp8.hip b/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
+index d44a284..041c3ca 100644
+--- a/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
++++ b/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
+@@ -16,7 +16,7 @@ namespace comfy::hip_backend {
+ // Small-M path. A 16-row WMMA tile is mostly idle at small M, so reduce K
+ // across the wave instead: one wave per output column.
+ template <typename OutT>
+-__global__ __launch_bounds__(256) void gemv_fp8_kernel(
++__global__ __launch_bounds__(kWave * 8) void gemv_fp8_kernel(
+     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
+     int M, int N, int K, EpiTensorwise epi) {
+ 
+@@ -51,7 +51,9 @@ template <typename OutT>
+ static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
+                        EpiTensorwise epi, hipStream_t stream) {
+     if (M <= 8) {
+-        dim3 block(kWave, 8);
++        // One wave reduces one output column, so the x dimension has to be the
++        // device's wave size, not the host pass's wave32 kWave.
++        dim3 block(device_wave_size(), 8);
+         dim3 grid((N + 7) / 8, M);
+         gemv_fp8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
+         return;
+diff --git a/comfy_kitchen/backends/hip/ops/gemm_int8.hip b/comfy_kitchen/backends/hip/ops/gemm_int8.hip
+index e25ce8d..0dbe8e2 100644
+--- a/comfy_kitchen/backends/hip/ops/gemm_int8.hip
++++ b/comfy_kitchen/backends/hip/ops/gemm_int8.hip
+@@ -14,7 +14,7 @@ namespace comfy::hip_backend {
+ 
+ // Small-M path: reduce K across the wave, one wave per output column.
+ template <typename OutT>
+-__global__ __launch_bounds__(256) void gemv_int8_kernel(
++__global__ __launch_bounds__(kWave * 8) void gemv_int8_kernel(
+     const int8_t* __restrict__ A, const int8_t* __restrict__ B, OutT* __restrict__ C,
+     int M, int N, int K, int ldc, EpiRowwise epi) {
+ 
+@@ -50,7 +50,9 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
+     const uint8_t* Bu = reinterpret_cast<const uint8_t*>(B);
+ 
+     if (M <= 8) {
+-        dim3 block(kWave, 8);
++        // One wave reduces one output column, so the x dimension has to be the
++        // device's wave size, not the host pass's wave32 kWave.
++        dim3 block(device_wave_size(), 8);
+         dim3 grid((N + 7) / 8, M);
+         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+         return;
+diff --git a/comfy_kitchen/backends/hip/ops/gemv_awq.hip b/comfy_kitchen/backends/hip/ops/gemv_awq.hip
+index 1094f3b..8fc5b95 100644
+--- a/comfy_kitchen/backends/hip/ops/gemv_awq.hip
++++ b/comfy_kitchen/backends/hip/ops/gemv_awq.hip
+@@ -92,7 +92,9 @@ extern "C" void launch_gemv_awq_kernel(
+                                  " must be a multiple of group_size=" + std::to_string(group_size));
+     }
+ 
+-    dim3 block(kWave, kAwqWavesPerBlock);
++    // One wave reduces one output column, and a wave is the device's wave size
++    // (64 on the Hygon DCU), not the host pass's wave32 kWave.
++    dim3 block(device_wave_size(), kAwqWavesPerBlock);
+     dim3 grid((N + kAwqWavesPerBlock - 1) / kAwqWavesPerBlock, M);
+     const int8_t* q = static_cast<const int8_t*>(qweight);
+ 
+diff --git a/comfy_kitchen/backends/hip/ops/na3d.hip b/comfy_kitchen/backends/hip/ops/na3d.hip
+index 66a3901..4af816b 100644
+--- a/comfy_kitchen/backends/hip/ops/na3d.hip
++++ b/comfy_kitchen/backends/hip/ops/na3d.hip
+@@ -26,7 +26,13 @@ namespace comfy::hip_backend {
+ // then skips, since the window a query sees is narrow by construction.
+ constexpr int kNaQueries = 16;
+ constexpr int kNaKeys = 16;
++// One wave per block. kWave is a device-pass constant, so the host pass reads
++// this as 32; the launcher sizes the block from device_wave_size() instead.
++#if defined(COMFY_MMA_GFX9)
++constexpr int kNaThreads = 64;
++#else
+ constexpr int kNaThreads = 32;
++#endif
+ // LDS rows are padded to 9 dwords. LDS has 32 four-byte banks and gcd(9, 32) = 1,
+ // so the 16 row-strided lanes of a fragment read reach 16 distinct banks; an
+ // 8-dword or 12-dword row collapses them onto 4 or 8.
+@@ -48,11 +54,21 @@ __forceinline__ __device__ void axis_window(int i, int k, int len, bool causal,
+     }
+ }
+ 
+-// Reduce across the 16 lanes holding one accumulator row. They are a half-wave, so
+-// the offsets stop at 8 and never cross into the other half's rows.
++// Reduce across the lanes that share one accumulator row. Which lanes those are
++// is the policy's: on RDNA the row is a function of lane/16, so the group is the
++// 16 lanes of one half-wave; on gfx9 the row is lane%16, so it is the four lanes
++// 16 apart. Folding over the wrong bits would mix two rows together.
++#if defined(COMFY_MMA_GFX9)
++constexpr int kNaReduceFirst = 16;
++constexpr int kNaReduceLast = 32;
++#else
++constexpr int kNaReduceFirst = 1;
++constexpr int kNaReduceLast = 8;
++#endif
++
+ __forceinline__ __device__ float row_reduce_max(float v) {
+     #pragma unroll
+-    for (int off = 1; off <= 8; off <<= 1) {
++    for (int off = kNaReduceFirst; off <= kNaReduceLast; off <<= 1) {
+         v = fmaxf(v, __shfl_xor(v, off, kWave));
+     }
+     return v;
+@@ -60,7 +76,7 @@ __forceinline__ __device__ float row_reduce_max(float v) {
+ 
+ __forceinline__ __device__ float row_reduce_sum(float v) {
+     #pragma unroll
+-    for (int off = 1; off <= 8; off <<= 1) {
++    for (int off = kNaReduceFirst; off <= kNaReduceLast; off <<= 1) {
+         v += __shfl_xor(v, off, kWave);
+     }
+     return v;
+@@ -87,7 +103,9 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
+     __shared__ Elem sP[kNaQueries * LD];  // probabilities: sP[query][key]
+ 
+     const int lane = threadIdx.x;
+-    const int r = frag_row(lane);  // fragment row, and this lane's score column
++    // The row of this lane's A and B fragments -- a query for Q, a key for K.
++    // It is not the score column: that is acc_col(lane, e), which moves with `e`.
++    const int r = frag_row(lane);
+     const int t_q = blockIdx.y / h_size;
+     const int h_q = blockIdx.y % h_size;
+     const int64_t base = static_cast<int64_t>(blockIdx.z / num_heads) * s_b +
+@@ -100,12 +118,14 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
+     axis_window(t_q, kt, t_size, causal_t, t_lo, t_hi);
+     axis_window(h_q, kh, h_size, causal_h, h_lo, h_hi);
+ 
+-    // The eight accumulator rows this lane owns, and each one's W window.
+-    int ws[8], we[8];
++    // Each accumulator row this lane owns, and that row's W window. A row's state
++    // is shared by every accumulator element that maps to it, which on gfx9 is all
++    // of them -- see kAccRowsPerLane / acc_row_slot.
++    int ws[kAccRowsPerLane], we[kAccRowsPerLane];
+     #pragma unroll
+-    for (int e = 0; e < 8; ++e) {
+-        const int wq = na_min(w0 + acc_row(lane, e), w_size - 1);
+-        axis_window(wq, kw, w_size, causal_w, ws[e], we[e]);
++    for (int s = 0; s < kAccRowsPerLane; ++s) {
++        const int wq = na_min(w0 + acc_row(lane, s), w_size - 1);
++        axis_window(wq, kw, w_size, causal_w, ws[s], we[s]);
+     }
+ 
+     // Key span of the block: the first query's window start through the last
+@@ -137,11 +157,11 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
+     for (int nt = 0; nt < NT; ++nt) {
+         o_acc[nt] = Mma::zero();
+     }
+-    float m_r[8], l_r[8];
++    float m_r[kAccRowsPerLane], l_r[kAccRowsPerLane];
+     #pragma unroll
+-    for (int e = 0; e < 8; ++e) {
+-        m_r[e] = kNaNegInf;
+-        l_r[e] = 0.0f;
++    for (int s = 0; s < kAccRowsPerLane; ++s) {
++        m_r[s] = kNaNegInf;
++        l_r[s] = 0.0f;
+     }
+ 
+     for (int tk = t_lo; tk < t_hi; ++tk) {
+@@ -191,26 +211,46 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
+                     }
+                 }
+ 
+-                // Masked online softmax. This lane holds score column wk0 + r for
+-                // each of its accumulator rows.
+-                const int wk = wk0 + r;
+-                const bool in_tile = (wk - wk0) < n_valid_k;
+-                float p_val[8], m_new[8];
++                // Masked online softmax. The accumulator element's column is the
++                // key, and on gfx9 it moves with `e` rather than being lane%16, so
++                // it has to be asked for per element. Every element that maps to
++                // one accumulator row shares that row's max and denominator, so
++                // the elements are folded together before the cross-lane reduce.
++                float p_val[Mma::kAccElems], m_new[kAccRowsPerLane];
+                 #pragma unroll
+-                for (int e = 0; e < 8; ++e) {
+-                    const bool vis = in_tile && wk >= ws[e] && wk < we[e];
++                for (int e = 0; e < Mma::kAccElems; ++e) {
++                    const int wk = wk0 + acc_col(lane, e);
++                    const int s = acc_row_slot(e);
++                    const bool vis = (wk - wk0) < n_valid_k && wk >= ws[s] && wk < we[s];
+                     p_val[e] = vis ? Mma::get(s_acc, e) * scale : kNaNegInf;
+-                    m_new[e] = row_reduce_max(fmaxf(m_r[e], p_val[e]));
+                 }
+                 #pragma unroll
+-                for (int e = 0; e < 8; ++e) {
+-                    const float alpha = __expf(m_r[e] - m_new[e]);
+-                    m_r[e] = m_new[e];
+-                    p_val[e] = (p_val[e] <= kNaNegInf) ? 0.0f : __expf(p_val[e] - m_new[e]);
+-                    l_r[e] = l_r[e] * alpha + row_reduce_sum(p_val[e]);
++                for (int s = 0; s < kAccRowsPerLane; ++s) {
++                    float local = m_r[s];
++                    #pragma unroll
++                    for (int e = 0; e < Mma::kAccElems; ++e) {
++                        if (acc_row_slot(e) == s) local = fmaxf(local, p_val[e]);
++                    }
++                    m_new[s] = row_reduce_max(local);
++                }
++                #pragma unroll
++                for (int s = 0; s < kAccRowsPerLane; ++s) {
++                    const float alpha = __expf(m_r[s] - m_new[s]);
++                    m_r[s] = m_new[s];
++                    float local = 0.0f;
++                    #pragma unroll
++                    for (int e = 0; e < Mma::kAccElems; ++e) {
++                        if (acc_row_slot(e) != s) continue;
++                        p_val[e] = (p_val[e] <= kNaNegInf) ? 0.0f : __expf(p_val[e] - m_new[s]);
++                        local += p_val[e];
++                    }
++                    l_r[s] = l_r[s] * alpha + row_reduce_sum(local);
+                     #pragma unroll
+                     for (int nt = 0; nt < NT; ++nt) {
+-                        o_acc[nt][e] *= alpha;
++                        #pragma unroll
++                        for (int e = 0; e < Mma::kAccElems; ++e) {
++                            if (acc_row_slot(e) == s) o_acc[nt][e] *= alpha;
++                        }
+                     }
+                 }
+ 
+@@ -218,8 +258,8 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
+                 // and the accumulator gave this lane a column. The barrier below
+                 // publishes the V transpose staged above as well.
+                 #pragma unroll
+-                for (int e = 0; e < 8; ++e) {
+-                    sP[acc_row(lane, e) * LD + acc_col(lane)] = static_cast<Elem>(p_val[e]);
++                for (int e = 0; e < Mma::kAccElems; ++e) {
++                    sP[acc_row(lane, e) * LD + acc_col(lane, e)] = static_cast<Elem>(p_val[e]);
+                 }
+                 __syncthreads();
+ 
+@@ -236,13 +276,13 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
+ 
+     const int64_t orow = base + static_cast<int64_t>(t_q) * s_t + static_cast<int64_t>(h_q) * s_h;
+     #pragma unroll
+-    for (int e = 0; e < 8; ++e) {
++    for (int e = 0; e < Mma::kAccElems; ++e) {
+         const int row = acc_row(lane, e);
+         if (row >= n_valid_q) {
+             continue;
+         }
+-        const float inv_l = 1.0f / fmaxf(l_r[e], 1e-30f);
+-        Elem* dst = out + orow + static_cast<int64_t>(w0 + row) * s_w + acc_col(lane);
++        const float inv_l = 1.0f / fmaxf(l_r[acc_row_slot(e)], 1e-30f);
++        Elem* dst = out + orow + static_cast<int64_t>(w0 + row) * s_w + acc_col(lane, e);
+         #pragma unroll
+         for (int nt = 0; nt < NT; ++nt) {
+             dst[nt * 16] = static_cast<Elem>(Mma::get(o_acc[nt], e) * inv_l);
+@@ -261,9 +301,12 @@ void launch_na3d_typed(
+ 
+     using Elem = typename Mma::Elem;
+     const dim3 grid((w_size + kNaQueries - 1) / kNaQueries, t_size * h_size, batch * num_heads);
++    // One wave per block, and kWave reads wave32 in this host pass even for a
++    // gfx9 build, so the block size comes from the device. See device_wave_size.
++    const int threads = device_wave_size();
+ 
+ #define COMFY_NA3D_LAUNCH(HD_)                                                                 \
+-    na3d_kernel<Mma, HD_><<<grid, kNaThreads, 0, stream>>>(                                    \
++    na3d_kernel<Mma, HD_><<<grid, threads, 0, stream>>>(                                       \
+         reinterpret_cast<const Elem*>(q), reinterpret_cast<const Elem*>(k),                    \
+         reinterpret_cast<const Elem*>(v), reinterpret_cast<Elem*>(out),                        \
+         t_size, h_size, w_size, num_heads, s_b, s_t, s_h, s_w, s_n,                            \
+diff --git a/comfy_kitchen/backends/hip/ops/svdquant_w4a4.hip b/comfy_kitchen/backends/hip/ops/svdquant_w4a4.hip
+index 107e46c..0387ce6 100644
+--- a/comfy_kitchen/backends/hip/ops/svdquant_w4a4.hip
++++ b/comfy_kitchen/backends/hip/ops/svdquant_w4a4.hip
+@@ -26,6 +26,17 @@ namespace comfy::hip_backend {
+ constexpr int kSvdGroup = 64;       // quantization group, in elements
+ constexpr int kSvdGroupBytes = 32;  // ... and in packed int4 bytes
+ 
++// The GEMM below is an 8-warp grid (wm = warp/2 over 4*TM*16 rows, wn = warp%2
++// over 2*TN*16 columns), so the block is eight waves. kWave is a device-pass
++// constant and reads wave32 in the host pass even for a gfx9 build, so the
++// launcher sizes the block from device_wave_size() and this only has to agree
++// with it on the device side.
++#if defined(COMFY_MMA_GFX9)
++constexpr int kSvdThreads = 8 * 64;
++#else
++constexpr int kSvdThreads = 8 * 32;
++#endif
++
+ // x @ proj_down -> (M, R), fp32. One thread per output column: proj_down is
+ // (K, R), so consecutive threads read consecutive addresses.
+ __global__ __launch_bounds__(256) void lora_down_kernel(
+@@ -93,7 +104,7 @@ __global__ __launch_bounds__(256) void svdquant_quant_kernel(
+ 
+ // Group-scaled int4 GEMM with the LoRA-up correction folded into the writeback.
+ template <typename OutT, bool UNSIGNED>
+-__global__ __launch_bounds__(256) void svdquant_gemm_kernel(
++__global__ __launch_bounds__(kSvdThreads) void svdquant_gemm_kernel(
+     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
+     const void* __restrict__ ascales, const void* __restrict__ wscales,
+     const void* __restrict__ lora_act, const void* __restrict__ lora_up,
+@@ -118,12 +129,12 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
+     const int n0 = blockIdx.x * BN;
+     const int kbytes = K / 2;
+ 
+-    float fout[TM][TN][8] = {};
++    float fout[TM][TN][MmaInt4::kAccElems] = {};
+ 
+     const int row = frag_row(lane);
+ 
+-    TileStager<BM, BKB, 256> sa;
+-    TileStager<BN, BKB, 256> sb;
++    TileStager<BM, BKB, kSvdThreads> sa;
++    TileStager<BN, BKB, kSvdThreads> sb;
+ 
+     sa.load(A, m0, M, 0, kbytes);
+     sb.load(B, n0, N, 0, kbytes);
+@@ -166,7 +177,10 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
+                 typename MmaInt4::Frag af[TM];
+                 #pragma unroll
+                 for (int i = 0; i < TM; ++i)
+-                    af[i] = MmaInt4::load(As, wm * (TM * 16) + i * 16 + row, kbyte, kStride, lane);
++                    af[i] = UNSIGNED ? MmaInt4::load_unsigned(As, wm * (TM * 16) + i * 16 + row,
++                                                              kbyte, kStride, lane)
++                                     : MmaInt4::load(As, wm * (TM * 16) + i * 16 + row, kbyte,
++                                                     kStride, lane);
+ 
+                 typename MmaInt4::Frag bf[TN];
+                 #pragma unroll
+@@ -186,13 +200,13 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
+             const int g = kb0 / kSvdGroupBytes + grp;
+             #pragma unroll
+             for (int j = 0; j < TN; ++j) {
+-                const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane);
+-                if (col >= N) continue;
+-                const float ws = load_in(wscales, static_cast<int64_t>(g) * N + col, ws_code);
+                 #pragma unroll
+-                for (int i = 0; i < TM; ++i) {
++                for (int e = 0; e < MmaInt4::kAccElems; ++e) {
++                    const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane, e);
++                    if (col >= N) continue;
++                    const float ws = load_in(wscales, static_cast<int64_t>(g) * N + col, ws_code);
+                     #pragma unroll
+-                    for (int e = 0; e < 8; ++e) {
++                    for (int i = 0; i < TM; ++i) {
+                         const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+                         if (r >= M) continue;
+                         const float as =
+@@ -213,12 +227,12 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
+ 
+     #pragma unroll
+     for (int j = 0; j < TN; ++j) {
+-        const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane);
+-        if (col >= N) continue;
+         #pragma unroll
+-        for (int i = 0; i < TM; ++i) {
++        for (int e = 0; e < MmaInt4::kAccElems; ++e) {
++            const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane, e);
++            if (col >= N) continue;
+             #pragma unroll
+-            for (int e = 0; e < 8; ++e) {
++            for (int i = 0; i < TM; ++i) {
+                 const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+                 if (r >= M) continue;
+ 
+@@ -298,10 +312,9 @@ extern "C" void launch_svdquant_gemm_kernel(
+     const uint8_t* B = static_cast<const uint8_t*>(b);
+ 
+ #define CK_SVD_LAUNCH(T, U)                                                                    \
+-    svdquant_gemm_kernel<T, U><<<grid, 256, 0, stream>>>(A, B, static_cast<T*>(c), ascales,     \
+-                                                         wscales, lora_act, lora_up, bias, M, N, \
+-                                                         K, R, as_code, ws_code, la_code,        \
+-                                                         lu_code, bias_code)
++    svdquant_gemm_kernel<T, U><<<grid, 8 * device_wave_size(), 0, stream>>>(                    \
++        A, B, static_cast<T*>(c), ascales, wscales, lora_act, lora_up, bias, M, N, K, R,        \
++        as_code, ws_code, la_code, lu_code, bias_code)
+ 
+     if (out_code == kBF16) {
+         if (act_unsigned) { CK_SVD_LAUNCH(__bf16, true); } else { CK_SVD_LAUNCH(__bf16, false); }
+diff --git a/comfy_kitchen/backends/hip/ops/w4a8_gemv.hip b/comfy_kitchen/backends/hip/ops/w4a8_gemv.hip
+index ab6d13c..b9de387 100644
+--- a/comfy_kitchen/backends/hip/ops/w4a8_gemv.hip
++++ b/comfy_kitchen/backends/hip/ops/w4a8_gemv.hip
+@@ -146,7 +146,11 @@ extern "C" bool launch_w4a8_codebook_gemv_kernel(
+     // Same epilogue object the INT8 GEMM builds, so the two paths round alike.
+     EpiRowwise epi{static_cast<const float*>(xs), static_cast<const float*>(s_channel), 1, bias,
+                    bias_code};
+-    const dim3 block(kWave * kW4a8GemvWaves);
++    // kWave is the device-pass constant: it is 32 in the host pass even on a gfx9
++    // build, while the kernel body below maps columns with the wave it actually
++    // runs on. Sizing the block from kWave would launch half the threads the
++    // tid/kWave mapping needs on the Hygon DCU and leave the upper columns unwritten.
++    const dim3 block(device_wave_size() * kW4a8GemvWaves);
+     const dim3 grid(static_cast<unsigned int>((N + kW4a8GemvWaves - 1) / kW4a8GemvWaves));
+ 
+ #define CK_W4A8_GEMV_LAUNCH(OutT)                                                              \
+diff --git a/comfy_kitchen/backends/hip/sage_attention/int8_attn.hip b/comfy_kitchen/backends/hip/sage_attention/int8_attn.hip
+index e8b5a42..8b613bc 100644
+--- a/comfy_kitchen/backends/hip/sage_attention/int8_attn.hip
++++ b/comfy_kitchen/backends/hip/sage_attention/int8_attn.hip
+@@ -33,32 +33,20 @@ enum class MaskMode { kNone = 0, kCustom = 2 };
+ 
+ namespace {
+ 
+-constexpr int kCtaQ = 128;
+-// gfx11 reads a whole 16-byte K-step per lane, so a 16-byte row keeps that to one
+-// LDS instruction; the wider pad costs a two-way bank conflict and buys back four
+-// times the issue slots. gfx12 reads 8 bytes, where an 8-byte pad is already one
+-// instruction and keeps 16 rows on 16 distinct banks.
+-#if defined(COMFY_MMA_GFX11)
+-constexpr int kLdsPad = 16;
+-#else
+-constexpr int kLdsPad = 8;
+-#endif
++// The RDNA body below is wave32 and WMMA-shaped. The Hygon DCU is wave64 with
++// Hygon's v_mmac_* matrix core and a different accumulator layout, so it gets its
++// own body rather than a policy swap. Both define launch_one with the same
++// signature; everything after the anonymous namespace is shared.
+ 
+ __forceinline__ __device__ int imin(int a, int b) { return a < b ? a : b; }
+ 
+ constexpr int div_ceil_host(int a, int b) { return (a + b - 1) / b; }
+ 
+-// 16 queries per wave at every head_dim. The CUDA launcher widens D64 to 32 to
+-// halve its shared-memory traffic; here the output accumulator is transposed, so
+-// a wider query tile grows the live FP32 set instead and spills on both families.
+-template <int HD>
+-struct Shape {
+-    static constexpr int kWarpQ = 16;
+-    static constexpr int kWaves = kCtaQ / kWarpQ;
+-    static constexpr int kThreads = kWaves * 32;
+-    static constexpr int kQueryTiles = kWarpQ / 16;
+-    static constexpr int kDimTiles = HD / 16;
+-};
++// Round to nearest even and saturate, matching cvt.rni.sat.u8.f32 in the CUDA
++// backend's pack_u8x4.
++__forceinline__ __device__ uint32_t prob_to_u8(float p) {
++    return static_cast<uint32_t>(fminf(255.0f, fmaxf(0.0f, rintf(p))));
++}
+ 
+ // Reads one mask element as raw bits. -ffast-math folds isfinite() away, so the
+ // non-finite test that decides whether an additive bias means "drop this key"
+@@ -87,6 +75,31 @@ __forceinline__ __device__ bool mask_keep(const void* mask, int64_t offset, int
+     return true;
+ }
+ 
++#if !defined(COMFY_MMA_GFX9)
++
++constexpr int kCtaQ = 128;
++// gfx11 reads a whole 16-byte K-step per lane, so a 16-byte row keeps that to one
++// LDS instruction; the wider pad costs a two-way bank conflict and buys back four
++// times the issue slots. gfx12 reads 8 bytes, where an 8-byte pad is already one
++// instruction and keeps 16 rows on 16 distinct banks.
++#if defined(COMFY_MMA_GFX11)
++constexpr int kLdsPad = 16;
++#else
++constexpr int kLdsPad = 8;
++#endif
++
++// 16 queries per wave at every head_dim. The CUDA launcher widens D64 to 32 to
++// halve its shared-memory traffic; here the output accumulator is transposed, so
++// a wider query tile grows the live FP32 set instead and spills on both families.
++template <int HD>
++struct Shape {
++    static constexpr int kWarpQ = 16;
++    static constexpr int kWaves = kCtaQ / kWarpQ;
++    static constexpr int kThreads = kWaves * 32;
++    static constexpr int kQueryTiles = kWarpQ / 16;
++    static constexpr int kDimTiles = HD / 16;
++};
++
+ template <int HD, int CTA_K, MaskMode kMask, typename OutT>
+ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
+     const int8_t* __restrict__ q, const int8_t* __restrict__ k, const int8_t* __restrict__ v,
+@@ -435,13 +448,391 @@ void launch_one(const int8_t* q, const int8_t* k, const int8_t* v, OutT* o, cons
+                 int64_t o_stride_h, int64_t o_stride_n, float sm_scale, hipStream_t stream) {
+ 
+     const dim3 grid(div_ceil_host(qo_len, kCtaQ), num_qo_heads, batch);
+-    int8_attn_kernel<HD, CTA_K, kMask, OutT><<<grid, Shape<HD>::kThreads, 0, stream>>>(
++    // The host pass never defines COMFY_MMA_GFX9, so on a gfx9 build it compiles
++    // THIS launcher while the device runs the gfx9 body above. That body's
++    // staging loops stride by kThreads9 = kWaves9 * 64, so the block has to be
++    // sized from the device's wave (64 on gfx9, 32 elsewhere); Shape<HD>::kThreads
++    // is the wave32 constant and would leave the upper half of the V tile
++    // unstaged, zeroing every output channel past the first 64.
++    const int threads = Shape<HD>::kWaves * device_wave_size();
++    int8_attn_kernel<HD, CTA_K, kMask, OutT><<<grid, threads, 0, stream>>>(
++        q, k, v, o, q_scale, k_scale, v_scale, mask, mask_stride_b, mask_stride_h, mask_stride_q,
++        mask_stride_k, mask_dtype_code, qo_len, kv_len, qo_len_padded, k_groups_per_head,
++        num_kv_groups, q_stride_b, q_stride_h, k_stride_b, k_stride_h, v_stride_b, v_stride_h,
++        v_stride_d, o_stride_b, o_stride_h, o_stride_n, sm_scale);
++}
++
++#else  // COMFY_MMA_GFX9
++
++// ---------------------------------------------------------------------------
++// Hygon DCU (gfx906..gfx938) int8 attention: wave64, v_mmac_i32_16x16x32.
++//
++// The RDNA body evaluates the scores TRANSPOSED, S^T = K @ Q^T, because its
++// accumulator gives a lane one column and eight rows, which turns the online
++// softmax into a per-lane reduction folded by one shuffle. The Hygon
++// accumulator gives a lane one ROW and four columns four apart,
++// C[l%16][4*i + l/16], so the transposed form would scatter one query across
++// sixteen lanes. This body evaluates S = Q @ K^T instead: a lane owns query
++// l%16 and the keys {l/16, 4+l/16, 8+l/16, 12+l/16}, and the four lanes that
++// share l%16 are one query's group -- they cover its sixteen keys and fold with
++// two shuffles.
++//
++// Tiling: 128 queries per block, 16 per wave (a wave is 64 lanes), 32 keys per
++// iteration. 32 is the i8 MMA's K, so one iteration's probabilities are exactly
++// one P fragment. K is staged key-major and V channel-major, which is the order
++// each already has in global memory, and that makes both MMA B operands eight
++// contiguous bytes.
++// ---------------------------------------------------------------------------
++
++constexpr int kCtaQ9 = 128;
++constexpr int kWarpQ9 = 16;
++constexpr int kWaves9 = kCtaQ9 / kWarpQ9;
++constexpr int kThreads9 = kWaves9 * 64;
++constexpr int kCtaK9 = 32;
++constexpr int kLdsPad9 = 8;
++// Two 16-key score tiles per iteration; the score accumulator covers one at a
++// time.
++constexpr int kScoreTiles9 = kCtaK9 / 16;
++// P is [query][key] with 32 keys a row. The four-byte pad puts the sixteen rows
++// of a wave on sixteen distinct bank pairs.
++constexpr int kStrideP9 = kCtaK9 + 4;
++
++// Fold one query's group: the four lanes with the same l%16, i.e. l/16 = 0..3.
++// XOR with 16 and 32 stays inside that group because both preserve the low four
++// bits, which carry the query index.
++__forceinline__ __device__ float query_group_max9(float v) {
++    v = fmaxf(v, __shfl_xor(v, 16, 64));
++    v = fmaxf(v, __shfl_xor(v, 32, 64));
++    return v;
++}
++__forceinline__ __device__ float query_group_sum9(float v) {
++    v += __shfl_xor(v, 16, 64);
++    v += __shfl_xor(v, 32, 64);
++    return v;
++}
++__forceinline__ __device__ int query_group_any9(int v) {
++    v |= __shfl_xor(v, 16, 64);
++    v |= __shfl_xor(v, 32, 64);
++    return v;
++}
++
++// The score MMA's B operand is K^T, but K is staged key-major, so the fragment
++// this lane owns -- K^T[channel 8*(l/16) + p][key] -- runs along the channel
++// axis and reads exactly like an A fragment whose row is the key. `key` is the
++// logical key of the fragment column, which is 16*t + l%16 for score tile t.
++__forceinline__ __device__ long load_frag_kt9(const void* lds, int key, int kbyte, int stride,
++                                              int lane) {
++    return load_frag_b64_a(lds, key, kbyte, stride, lane);
++}
++
++// Output element i of this lane is channel 4*i + l/16, one row per lane.
++template <typename OutT>
++__forceinline__ __device__ void store_o_tile9(OutT* __restrict__ row, int d_base,
++                                              const float* vals, int lane) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        row[d_base + 4 * i + (lane / 16)] = static_cast<OutT>(vals[i]);
++    }
++}
++
++// Same name and template parameter list as the RDNA body above: the two are
++// mutually exclusive per compilation pass, and the host pass never sees
++// COMFY_MMA_GFX9, so it registers the RDNA spelling. A different device-side
++// name would leave the launch pointing at a symbol that is not in the image.
++// CTA_K is ignored here -- see launch_one below.
++template <int HD, int CTA_K, MaskMode kMask, typename OutT>
++__global__ __launch_bounds__(kThreads9) void int8_attn_kernel(
++    const int8_t* __restrict__ q, const int8_t* __restrict__ k, const int8_t* __restrict__ v,
++    OutT* __restrict__ o, const float* __restrict__ q_scale, const float* __restrict__ k_scale,
++    const float* __restrict__ v_scale, const void* __restrict__ mask, int64_t mask_stride_b,
++    int64_t mask_stride_h, int64_t mask_stride_q, int64_t mask_stride_k, int mask_dtype_code,
++    int qo_len, int kv_len, int qo_len_padded, int k_groups_per_head, int num_kv_groups,
++    int64_t q_stride_b, int64_t q_stride_h, int64_t k_stride_b, int64_t k_stride_h,
++    int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_d, int64_t o_stride_b,
++    int64_t o_stride_h, int64_t o_stride_n, float sm_scale) {
++
++    constexpr int kDimTiles = HD / 32;           // 32 channels per score MMA
++    constexpr int kOutTiles = HD / 16;           // 16 channels per output MMA
++    constexpr int kUnits = HD / 8;
++    constexpr int kUnitsV = kCtaK9 / 8;
++    constexpr int kStrideK = HD + kLdsPad9;      // [key][d]
++    constexpr int kStrideV = kCtaK9 + kLdsPad9;  // [d][key]
++    constexpr bool kCustomMask = kMask == MaskMode::kCustom;
++
++    // K key-major, V channel-major -- each the order it already has in global.
++    // P is per wave: 16 queries by 32 keys, staged so the second MMA reads a
++    // lane's eight consecutive keys in one load.
++    __shared__ __attribute__((aligned(16))) int8_t smem_k[kCtaK9 * kStrideK];
++    __shared__ __attribute__((aligned(16))) int8_t smem_v[HD * kStrideV];
++    __shared__ __attribute__((aligned(16))) uint8_t smem_p[kWaves9 * kWarpQ9 * kStrideP9];
++
++    const int tid = threadIdx.x;
++    const int lane = tid & 63;
++    const int wave = tid >> 6;
++    const int q_lane = lane % 16;   // this lane's query within the wave
++    const int g = lane / 16;        // which quarter of the keys it owns
++
++    const int block_q = blockIdx.x * kCtaQ9;
++    const int head = blockIdx.y;
++    const int batch = blockIdx.z;
++    const int num_qo_heads = gridDim.y;
++    const int kv_head = head / num_kv_groups;
++
++    const int8_t* q_head = q + static_cast<int64_t>(batch) * q_stride_b +
++                           static_cast<int64_t>(head) * q_stride_h;
++    const int8_t* k_head = k + static_cast<int64_t>(batch) * k_stride_b +
++                           static_cast<int64_t>(kv_head) * k_stride_h;
++    const int8_t* v_head = v + static_cast<int64_t>(batch) * v_stride_b +
++                           static_cast<int64_t>(kv_head) * v_stride_h;
++
++    // Base 2 throughout: the probabilities come out of exp2, not exp.
++    sm_scale *= kLog2e;
++
++    // This lane's query and its Q row. A query past the end reads a clamped row;
++    // its output is never stored and its scale is finite, so nothing downstream
++    // sees it.
++    const int q_idx = block_q + wave * kWarpQ9 + q_lane;
++    const int8_t* q_row = q_head + static_cast<int64_t>(imin(q_idx, qo_len - 1)) * HD;
++    const float q_lane_scale =
++        q_scale[(static_cast<int64_t>(batch) * num_qo_heads + head) * qo_len_padded +
++                imin(q_idx, qo_len_padded - 1)];
++
++    float o_val[kOutTiles][4];
++#pragma unroll
++    for (int dt = 0; dt < kOutTiles; ++dt) {
++#pragma unroll
++        for (int e = 0; e < 4; ++e) o_val[dt][e] = 0.0f;
++    }
++
++    // Finite sentinels, not -inf: a fully masked row divides by one instead of
++    // zero. Matches the RDNA body and the CUDA initial state.
++    float m_run = kMaskedScore;
++    float d_run = 1.0f;
++    bool row_valid = !kCustomMask;
++
++    const int num_iters = (kv_len + kCtaK9 - 1) / kCtaK9;
++
++    // Taking the maximum off the INT32 accumulator assumes the dequantization
++    // scale is positive. A negative softmax scale is legal and finite, so it
++    // gives up the fast path rather than report the wrong maximum.
++    int interior_iters = 0;
++    if constexpr (!kCustomMask) {
++        if (sm_scale >= 0.0f) interior_iters = kv_len / kCtaK9;
++    }
++
++    uint8_t* p_wave = smem_p + wave * (kWarpQ9 * kStrideP9);
++
++    // `boundary` is a compile-time tag, so the interior instance carries no mask
++    // test and no per-key bounds check at all.
++    auto run_iter = [&](auto boundary_tag, int iter) {
++        constexpr bool kBoundary = decltype(boundary_tag)::value;
++        const int kb0 = iter * kCtaK9;
++
++        __syncthreads();
++        // K tile, key-major [key][d]. A key past the end is zeroed and its score
++        // is masked below.
++        for (int idx = tid; idx < kCtaK9 * kUnits; idx += kThreads9) {
++            const int key = idx / kUnits;
++            const int unit = idx % kUnits;
++            const int gkey = kb0 + key;
++            uint2 val = {0u, 0u};
++            if (!kBoundary || gkey < kv_len) {
++                val = *reinterpret_cast<const uint2*>(k_head +
++                                                      static_cast<int64_t>(gkey) * HD + unit * 8);
++            }
++            *reinterpret_cast<uint2*>(smem_k + key * kStrideK + unit * 8) = val;
++        }
++        // V tile, channel-major [d][key] -- already so in global. The high bit of
++        // every byte is flipped: the second MMA is unsigned on BOTH operands and
++        // V is signed, so biasing it by 128 lets the u8 instruction read it, and
++        // the rowsum correction below takes the bias back out exactly.
++        for (int idx = tid; idx < HD * kUnitsV; idx += kThreads9) {
++            const int d = idx / kUnitsV;
++            const int unit = idx % kUnitsV;
++            const int gkey = kb0 + unit * 8;
++            uint2 val = {0x80808080u, 0x80808080u};
++            if (!kBoundary || gkey < kv_len) {
++                val = *reinterpret_cast<const uint2*>(v_head +
++                                                      static_cast<int64_t>(d) * v_stride_d + gkey);
++                val.x ^= 0x80808080u;
++                val.y ^= 0x80808080u;
++            }
++            *reinterpret_cast<uint2*>(smem_v + d * kStrideV + unit * 8) = val;
++        }
++        __syncthreads();
++
++        float key_scale[kScoreTiles9];
++#pragma unroll
++        for (int t = 0; t < kScoreTiles9; ++t) {
++            key_scale[t] =
++                k_scale[(static_cast<int64_t>(batch) * (num_qo_heads / num_kv_groups) + kv_head) *
++                            k_groups_per_head +
++                        iter * kScoreTiles9 + t];
++        }
++
++        // Hoisted: only the key term varies per element, and eight live 64-bit
++        // addresses in the inner loop cost registers this kernel does not have.
++        int64_t mask_row = 0;
++        if constexpr (kCustomMask) {
++            mask_row = static_cast<int64_t>(batch) * mask_stride_b +
++                       static_cast<int64_t>(head) * mask_stride_h +
++                       static_cast<int64_t>(imin(q_idx, qo_len - 1)) * mask_stride_q;
++        }
++
++        // --- score: two 16-key tiles, S = Q @ K^T ---
++        // Tile t's accumulator element e of this lane is its query's key
++        // 16*t + 4*e + g.
++        typename MmaInt8::Acc s_acc[kScoreTiles9];
++        float sc[kScoreTiles9][4];
++        float m_lane = kMaskedScore;
++#pragma unroll
++        for (int t = 0; t < kScoreTiles9; ++t) {
++            s_acc[t] = MmaInt8::zero();
++#pragma unroll
++            for (int dt = 0; dt < kDimTiles; ++dt) {
++                s_acc[t] = MmaInt8::mma(
++                    MmaInt8::load_aligned(q_row, 0, dt * 32, 0, lane),
++                    load_frag_kt9(smem_k, t * 16 + q_lane, dt * 32, kStrideK, lane), s_acc[t]);
++            }
++            const float tile_scale_k = sm_scale * q_lane_scale * key_scale[t];
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const int gkey = kb0 + 16 * t + 4 * e + g;
++                float score = static_cast<float>(s_acc[t][e]) * tile_scale_k;
++                bool keep = !kBoundary || gkey < kv_len;
++                if constexpr (kCustomMask) {
++                    if (kBoundary) {
++                        keep = keep && q_idx < qo_len;
++                        if (keep) {
++                            float bias;
++                            keep = mask_keep(
++                                mask, mask_row + static_cast<int64_t>(gkey) * mask_stride_k,
++                                mask_dtype_code, bias);
++                            score += bias * kLog2e;
++                        }
++                        row_valid = row_valid || keep;
++                    }
++                }
++                sc[t][e] = keep ? score : kMaskedScore;
++                m_lane = fmaxf(m_lane, sc[t][e]);
++            }
++        }
++        // The four lanes of the group hold different keys of the same query, so
++        // the iteration maximum has to be folded across them before anything
++        // exponentiates.
++        const float tile_m = query_group_max9(m_lane) - kProbU8Offset;
++
++        // --- online softmax ---
++        // The tile maximum's gap to the running one rides on the accumulator side
++        // as p_scale, which underflows to zero for a fully masked tile.
++        const float m_prev = m_run;
++        const float smaller = exp2f(-fabsf(m_prev - tile_m));
++        const float o_scale = m_prev < tile_m ? smaller : 1.0f;
++        const float p_scale = tile_m < m_prev ? smaller : 1.0f;
++        m_run = fmaxf(m_prev, tile_m);
++        d_run *= o_scale;
++#pragma unroll
++        for (int dt = 0; dt < kOutTiles; ++dt) {
++#pragma unroll
++            for (int e = 0; e < 4; ++e) o_val[dt][e] *= o_scale;
++        }
++
++        // --- probabilities: exp2, then stage P for the second MMA ---
++        // The shift by kProbU8Offset fills the unsigned INT8 range, and it cancels
++        // between the numerator and the denominator, so both carry it.
++        float tile_sum = 0.0f;
++        float p_rowsum = 0.0f;
++        const float neg_m = -tile_m;
++#pragma unroll
++        for (int t = 0; t < kScoreTiles9; ++t) {
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const float p = exp2f(sc[t][e] + neg_m);
++                tile_sum += p;
++                const uint32_t q8 = prob_to_u8(p);
++                p_rowsum += static_cast<float>(q8);
++                p_wave[q_lane * kStrideP9 + 16 * t + 4 * e + g] = static_cast<uint8_t>(q8);
++            }
++        }
++        d_run += query_group_sum9(tile_sum) * p_scale;
++        // The bias the V staging added, in the accumulator's own units: 128 times
++        // this query's quantized probabilities summed over all 32 keys.
++        const float v_bias = 128.0f * query_group_sum9(p_rowsum);
++
++        // Every lane of the group wrote P at an offset another lane reads, so the
++        // wave has to be ordered before the second MMA.
++        __syncthreads();
++
++        // --- output: O += P @ V, one MMA per 16-channel tile (K = 32) ---
++#pragma unroll
++        for (int dt = 0; dt < kOutTiles; ++dt) {
++            typename MmaInt8::Acc partial = MmaInt8::mma_ub(
++                load_frag_b64_a(p_wave, q_lane, 0, kStrideP9, lane),
++                load_frag_b64_a(smem_v, dt * 16 + q_lane, 0, kStrideV, lane),
++                MmaInt8::zero());
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                o_val[dt][e] =
++                    fmaf(static_cast<float>(partial[e]) - v_bias, p_scale, o_val[dt][e]);
++            }
++        }
++    };
++
++    int iter = 0;
++    for (; iter < interior_iters; ++iter) run_iter(std::false_type{}, iter);
++    for (; iter < num_iters; ++iter) run_iter(std::true_type{}, iter);
++
++    // d_run was already folded across the query group on every iteration -- the
++    // four lanes hold different keys of the same query -- so it needs no final
++    // pass. row_valid was not: each lane only saw its own keys.
++    if constexpr (kCustomMask) {
++        row_valid = query_group_any9(row_valid ? 1 : 0) != 0;
++    }
++
++    const float* v_scale_head =
++        v_scale + (static_cast<int64_t>(batch) * (num_qo_heads / num_kv_groups) + kv_head) * HD;
++
++    if (q_idx >= qo_len) return;
++    const float inv_d = row_valid ? 1.0f / d_run : 0.0f;
++    OutT* row = o + static_cast<int64_t>(batch) * o_stride_b +
++                static_cast<int64_t>(head) * o_stride_h +
++                static_cast<int64_t>(q_idx) * o_stride_n;
++#pragma unroll
++    for (int dt = 0; dt < kOutTiles; ++dt) {
++        float vals[4];
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++            const int d = dt * 16 + 4 * e + g;
++            vals[e] = o_val[dt][e] * v_scale_head[d] * inv_d;
++        }
++        store_o_tile9<OutT>(row, dt * 16, vals, lane);
++    }
++}
++
++// CTA_K is the caller's requested key tile. The RDNA body honors it; this one
++// cannot, because its key tile is the i8 MMA's K of 32 and one iteration has to
++// be exactly one P fragment. It is accepted so the shared launcher macro has one
++// spelling, and ignored: the kernel above is what fixes the tile.
++template <int HD, int CTA_K, MaskMode kMask, typename OutT>
++void launch_one(const int8_t* q, const int8_t* k, const int8_t* v, OutT* o, const float* q_scale,
++                const float* k_scale, const float* v_scale, const void* mask,
++                int64_t mask_stride_b, int64_t mask_stride_h, int64_t mask_stride_q,
++                int64_t mask_stride_k, int mask_dtype_code, int batch, int qo_len, int kv_len,
++                int qo_len_padded, int num_qo_heads, int k_groups_per_head, int num_kv_groups,
++                int64_t q_stride_b, int64_t q_stride_h, int64_t k_stride_b, int64_t k_stride_h,
++                int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_d, int64_t o_stride_b,
++                int64_t o_stride_h, int64_t o_stride_n, float sm_scale, hipStream_t stream) {
++
++    const dim3 grid(div_ceil_host(qo_len, kCtaQ9), num_qo_heads, batch);
++    int8_attn_kernel<HD, CTA_K, kMask, OutT><<<grid, kThreads9, 0, stream>>>(
+         q, k, v, o, q_scale, k_scale, v_scale, mask, mask_stride_b, mask_stride_h, mask_stride_q,
+         mask_stride_k, mask_dtype_code, qo_len, kv_len, qo_len_padded, k_groups_per_head,
+         num_kv_groups, q_stride_b, q_stride_h, k_stride_b, k_stride_h, v_stride_b, v_stride_h,
+         v_stride_d, o_stride_b, o_stride_h, o_stride_n, sm_scale);
+ }
+ 
++#endif  // COMFY_MMA_GFX9
++
+ }  // namespace
+ }  // namespace comfy::hip_backend::sage
+ 
+diff --git a/comfy_kitchen/backends/hip/sage_attention/sage_common.h b/comfy_kitchen/backends/hip/sage_attention/sage_common.h
+index a604153..fb619d7 100644
+--- a/comfy_kitchen/backends/hip/sage_attention/sage_common.h
++++ b/comfy_kitchen/backends/hip/sage_attention/sage_common.h
+@@ -22,11 +22,18 @@ namespace comfy::hip_backend::sage {
+ 
+ // Every kernel here indexes lanes with & 31, reduces with a width of 32 and packs
+ // fragments per half wave. RDNA defaults to wave32, but -mwavefrontsize64 would
+-// compile all of that into silently wrong scales rather than an error.
++// compile all of that into silently wrong scales rather than an error. The Hygon
++// DCU is the other way round: wave64 always, and its mmac accumulator hands a
++// lane one row and four columns four apart, so the lane math differs there.
+ #if defined(__AMDGCN_WAVEFRONT_SIZE__)
++#if defined(COMFY_MMA_GFX9)
++static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 64,
++              "the gfx9 int8 attention kernels are wave64");
++#else
+ static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 32,
+               "the int8 attention kernels are wave32 only");
+ #endif
++#endif
+ 
+ // Softmax probabilities are unsigned int8, so the online maximum is shifted far
+ // enough that exp2 fills the whole range: exp2(7.9943534) rounds to 255. Mirrors
+@@ -116,6 +123,12 @@ __forceinline__ __device__ uint32_t swap_half_wave_b32(uint32_t v) {
+     return static_cast<uint32_t>(__builtin_amdgcn_permlanex16(
+         static_cast<int>(v), static_cast<int>(v), 0x76543210, 0xfedcba98, false, false));
+ }
++#elif defined(COMFY_MMA_GFX9)
++// wave64: the partner set is the other 32-lane half, so the exchange mask is 32,
++// not 16. Same purpose -- fold the two halves that split the keys of one query.
++__forceinline__ __device__ uint32_t swap_half_wave_b32(uint32_t v) {
++    return static_cast<uint32_t>(__shfl_xor(static_cast<int>(v), 32, 64));
++}
+ #else
+ __forceinline__ __device__ uint32_t swap_half_wave_b32(uint32_t v) {
+     return static_cast<uint32_t>(__shfl_xor(static_cast<int>(v), 16, 32));
+@@ -246,7 +259,16 @@ __forceinline__ __device__ uint32_t prob_to_u8(float p) {
+ __forceinline__ __device__ MmaInt8::Frag pack_prob_frag(const uint32_t p[8], int lane) {
+     const uint32_t lo = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+     const uint32_t hi = p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24);
+-#if !defined(COMFY_MMA_GFX11)
++#if defined(COMFY_MMA_GFX9)
++    // The DCU's P fragment is a single packed 64-bit value, not a subscriptable
++    // v2i, and its accumulator layout is a different shape besides, so this repack
++    // does not describe a correct DCU fragment. Nothing on the DCU calls it -- the
++    // gfx9 attention builds its own P -- but the Sol-Attention translation units
++    // include this header, so it has to compile.
++    (void)lane;
++    return static_cast<MmaInt8::Frag>(static_cast<uint64_t>(lo)) |
++           (static_cast<MmaInt8::Frag>(static_cast<uint64_t>(hi)) << 32);
++#elif !defined(COMFY_MMA_GFX11)
+     // gfx12, and the no-matrix-core stub, whose Frag is this narrow too.
+     (void)lane;
+     MmaInt8::Frag f;

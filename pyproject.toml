@@ -1,0 +1,124 @@
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+    "nanobind>=2.0.0",
+    # setup.py drives both extensions through CMake. 3.21 is the HIP language's own
+    # floor (CMAKE_HIP_ARCHITECTURES does not exist before it), but both backends
+    # ask FindPython for Development.SABIModule, which arrived in 3.26.
+    "cmake>=3.26",
+    # The HIP extension pins the Ninja generator on every platform: CMake's default
+    # generator on Windows is Visual Studio, which cannot build the HIP language.
+    "ninja",
+    "tomli; python_version < '3.11'",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfy-kitchen"
+version = "0.2.35"
+description = "Fast Kernel Library for ComfyUI with multiple compute backends"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+keywords = ["pytorch", "cuda", "quantization", "kernels", "diffusion"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Comfy-Org/comfy-kitchen"
+
+[project.optional-dependencies]
+cublas = [
+    "nvidia-cublas>=13.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-benchmark>=4.0.0",
+    "ruff>=0.1.0",
+]
+build = [
+    "nanobind>=2.0.0",
+]
+
+[tool.setuptools]
+# MANIFEST.in makes native sources available to source builds. Wheels need only
+# the compiled extensions and explicitly declared runtime data below.
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["comfy_kitchen*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+"comfy_kitchen.backends.cuda" = ["*.cuh", "*.h"]
+"comfy_kitchen.backends.hip" = ["architectures.json"]
+
+[tool.ruff]
+# Set the maximum line length to 100.
+line-length = 100
+
+# Assume Python 3.10 (lowest supported)
+target-version = "py310"
+
+# Exclude commonly ignored directories
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "*.egg-info",
+    ".pytest_cache",
+    "third_party",
+]
+
+[tool.ruff.lint]
+# Enable pycodestyle (`E`), Pyflakes (`F`), and isort (`I`) by default
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # Pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "SIM",   # flake8-simplify
+    "RUF",   # Ruff-specific rules
+]
+
+# Ignore specific rules
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+    "B008",  # Do not perform function call in argument defaults
+    "N802",  # Function name should be lowercase (ComfyUI Nodes)
+    "RUF022",
+    "SIM108",
+]
+
+# Allow autofix for all enabled rules
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.format]
+# Use double quotes for strings
+quote-style = "double"
+
+# Indent with spaces
+indent-style = "space"
+
+# Respect magic trailing commas
+skip-magic-trailing-comma = false
+
+# Auto-detect line endings
+line-ending = "auto"
