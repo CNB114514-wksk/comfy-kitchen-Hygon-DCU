@@ -8,6 +8,11 @@
     "gfx1035",
     "gfx1036"
   ],
+  "mmac_gfx9": [
+    "gfx906",
+    "gfx928",
+    "gfx938"
+  ],
   "wmma_gfx11": [
     "gfx1100",
     "gfx1101",

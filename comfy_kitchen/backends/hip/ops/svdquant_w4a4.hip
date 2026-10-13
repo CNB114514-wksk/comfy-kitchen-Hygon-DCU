@@ -26,6 +26,17 @@ namespace comfy::hip_backend {
 constexpr int kSvdGroup = 64;       // quantization group, in elements
 constexpr int kSvdGroupBytes = 32;  // ... and in packed int4 bytes
 
+// The GEMM below is an 8-warp grid (wm = warp/2 over 4*TM*16 rows, wn = warp%2
+// over 2*TN*16 columns), so the block is eight waves. kWave is a device-pass
+// constant and reads wave32 in the host pass even for a gfx9 build, so the
+// launcher sizes the block from device_wave_size() and this only has to agree
+// with it on the device side.
+#if defined(COMFY_MMA_GFX9)
+constexpr int kSvdThreads = 8 * 64;
+#else
+constexpr int kSvdThreads = 8 * 32;
+#endif
+
 // x @ proj_down -> (M, R), fp32. One thread per output column: proj_down is
 // (K, R), so consecutive threads read consecutive addresses.
 __global__ __launch_bounds__(256) void lora_down_kernel(
@@ -93,7 +104,7 @@ __global__ __launch_bounds__(256) void svdquant_quant_kernel(
 
 // Group-scaled int4 GEMM with the LoRA-up correction folded into the writeback.
 template <typename OutT, bool UNSIGNED>
-__global__ __launch_bounds__(256) void svdquant_gemm_kernel(
+__global__ __launch_bounds__(kSvdThreads) void svdquant_gemm_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
     const void* __restrict__ ascales, const void* __restrict__ wscales,
     const void* __restrict__ lora_act, const void* __restrict__ lora_up,
@@ -118,12 +129,12 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
     const int n0 = blockIdx.x * BN;
     const int kbytes = K / 2;
 
-    float fout[TM][TN][8] = {};
+    float fout[TM][TN][MmaInt4::kAccElems] = {};
 
     const int row = frag_row(lane);
 
-    TileStager<BM, BKB, 256> sa;
-    TileStager<BN, BKB, 256> sb;
+    TileStager<BM, BKB, kSvdThreads> sa;
+    TileStager<BN, BKB, kSvdThreads> sb;
 
     sa.load(A, m0, M, 0, kbytes);
     sb.load(B, n0, N, 0, kbytes);
@@ -166,7 +177,10 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
                 typename MmaInt4::Frag af[TM];
                 #pragma unroll
                 for (int i = 0; i < TM; ++i)
-                    af[i] = MmaInt4::load(As, wm * (TM * 16) + i * 16 + row, kbyte, kStride, lane);
+                    af[i] = UNSIGNED ? MmaInt4::load_unsigned(As, wm * (TM * 16) + i * 16 + row,
+                                                              kbyte, kStride, lane)
+                                     : MmaInt4::load(As, wm * (TM * 16) + i * 16 + row, kbyte,
+                                                     kStride, lane);
 
                 typename MmaInt4::Frag bf[TN];
                 #pragma unroll
@@ -186,13 +200,13 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
             const int g = kb0 / kSvdGroupBytes + grp;
             #pragma unroll
             for (int j = 0; j < TN; ++j) {
-                const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane);
-                if (col >= N) continue;
-                const float ws = load_in(wscales, static_cast<int64_t>(g) * N + col, ws_code);
                 #pragma unroll
-                for (int i = 0; i < TM; ++i) {
+                for (int e = 0; e < MmaInt4::kAccElems; ++e) {
+                    const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane, e);
+                    if (col >= N) continue;
+                    const float ws = load_in(wscales, static_cast<int64_t>(g) * N + col, ws_code);
                     #pragma unroll
-                    for (int e = 0; e < 8; ++e) {
+                    for (int i = 0; i < TM; ++i) {
                         const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
                         if (r >= M) continue;
                         const float as =
@@ -213,12 +227,12 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
 
     #pragma unroll
     for (int j = 0; j < TN; ++j) {
-        const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane);
-        if (col >= N) continue;
         #pragma unroll
-        for (int i = 0; i < TM; ++i) {
+        for (int e = 0; e < MmaInt4::kAccElems; ++e) {
+            const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane, e);
+            if (col >= N) continue;
             #pragma unroll
-            for (int e = 0; e < 8; ++e) {
+            for (int i = 0; i < TM; ++i) {
                 const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
                 if (r >= M) continue;
 
@@ -298,10 +312,9 @@ extern "C" void launch_svdquant_gemm_kernel(
     const uint8_t* B = static_cast<const uint8_t*>(b);
 
 #define CK_SVD_LAUNCH(T, U)                                                                    \
-    svdquant_gemm_kernel<T, U><<<grid, 256, 0, stream>>>(A, B, static_cast<T*>(c), ascales,     \
-                                                         wscales, lora_act, lora_up, bias, M, N, \
-                                                         K, R, as_code, ws_code, la_code,        \
-                                                         lu_code, bias_code)
+    svdquant_gemm_kernel<T, U><<<grid, 8 * device_wave_size(), 0, stream>>>(                    \
+        A, B, static_cast<T*>(c), ascales, wscales, lora_act, lora_up, bias, M, N, K, R,        \
+        as_code, ws_code, la_code, lu_code, bias_code)
 
     if (out_code == kBF16) {
         if (act_unsigned) { CK_SVD_LAUNCH(__bf16, true); } else { CK_SVD_LAUNCH(__bf16, false); }

@@ -16,7 +16,7 @@ namespace comfy::hip_backend {
 // Small-M path. A 16-row WMMA tile is mostly idle at small M, so reduce K
 // across the wave instead: one wave per output column.
 template <typename OutT>
-__global__ __launch_bounds__(256) void gemv_fp8_kernel(
+__global__ __launch_bounds__(kWave * 8) void gemv_fp8_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
     int M, int N, int K, EpiTensorwise epi) {
 
@@ -51,7 +51,9 @@ template <typename OutT>
 static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
                        EpiTensorwise epi, hipStream_t stream) {
     if (M <= 8) {
-        dim3 block(kWave, 8);
+        // One wave reduces one output column, so the x dimension has to be the
+        // device's wave size, not the host pass's wave32 kWave.
+        dim3 block(device_wave_size(), 8);
         dim3 grid((N + 7) / 8, M);
         gemv_fp8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
         return;

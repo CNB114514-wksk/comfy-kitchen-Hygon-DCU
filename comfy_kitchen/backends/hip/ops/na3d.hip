@@ -26,7 +26,13 @@ namespace comfy::hip_backend {
 // then skips, since the window a query sees is narrow by construction.
 constexpr int kNaQueries = 16;
 constexpr int kNaKeys = 16;
+// One wave per block. kWave is a device-pass constant, so the host pass reads
+// this as 32; the launcher sizes the block from device_wave_size() instead.
+#if defined(COMFY_MMA_GFX9)
+constexpr int kNaThreads = 64;
+#else
 constexpr int kNaThreads = 32;
+#endif
 // LDS rows are padded to 9 dwords. LDS has 32 four-byte banks and gcd(9, 32) = 1,
 // so the 16 row-strided lanes of a fragment read reach 16 distinct banks; an
 // 8-dword or 12-dword row collapses them onto 4 or 8.
@@ -48,11 +54,21 @@ __forceinline__ __device__ void axis_window(int i, int k, int len, bool causal, 
     }
 }
 
-// Reduce across the 16 lanes holding one accumulator row. They are a half-wave, so
-// the offsets stop at 8 and never cross into the other half's rows.
+// Reduce across the lanes that share one accumulator row. Which lanes those are
+// is the policy's: on RDNA the row is a function of lane/16, so the group is the
+// 16 lanes of one half-wave; on gfx9 the row is lane%16, so it is the four lanes
+// 16 apart. Folding over the wrong bits would mix two rows together.
+#if defined(COMFY_MMA_GFX9)
+constexpr int kNaReduceFirst = 16;
+constexpr int kNaReduceLast = 32;
+#else
+constexpr int kNaReduceFirst = 1;
+constexpr int kNaReduceLast = 8;
+#endif
+
 __forceinline__ __device__ float row_reduce_max(float v) {
     #pragma unroll
-    for (int off = 1; off <= 8; off <<= 1) {
+    for (int off = kNaReduceFirst; off <= kNaReduceLast; off <<= 1) {
         v = fmaxf(v, __shfl_xor(v, off, kWave));
     }
     return v;
@@ -60,7 +76,7 @@ __forceinline__ __device__ float row_reduce_max(float v) {
 
 __forceinline__ __device__ float row_reduce_sum(float v) {
     #pragma unroll
-    for (int off = 1; off <= 8; off <<= 1) {
+    for (int off = kNaReduceFirst; off <= kNaReduceLast; off <<= 1) {
         v += __shfl_xor(v, off, kWave);
     }
     return v;
@@ -87,7 +103,9 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
     __shared__ Elem sP[kNaQueries * LD];  // probabilities: sP[query][key]
 
     const int lane = threadIdx.x;
-    const int r = frag_row(lane);  // fragment row, and this lane's score column
+    // The row of this lane's A and B fragments -- a query for Q, a key for K.
+    // It is not the score column: that is acc_col(lane, e), which moves with `e`.
+    const int r = frag_row(lane);
     const int t_q = blockIdx.y / h_size;
     const int h_q = blockIdx.y % h_size;
     const int64_t base = static_cast<int64_t>(blockIdx.z / num_heads) * s_b +
@@ -100,12 +118,14 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
     axis_window(t_q, kt, t_size, causal_t, t_lo, t_hi);
     axis_window(h_q, kh, h_size, causal_h, h_lo, h_hi);
 
-    // The eight accumulator rows this lane owns, and each one's W window.
-    int ws[8], we[8];
+    // Each accumulator row this lane owns, and that row's W window. A row's state
+    // is shared by every accumulator element that maps to it, which on gfx9 is all
+    // of them -- see kAccRowsPerLane / acc_row_slot.
+    int ws[kAccRowsPerLane], we[kAccRowsPerLane];
     #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        const int wq = na_min(w0 + acc_row(lane, e), w_size - 1);
-        axis_window(wq, kw, w_size, causal_w, ws[e], we[e]);
+    for (int s = 0; s < kAccRowsPerLane; ++s) {
+        const int wq = na_min(w0 + acc_row(lane, s), w_size - 1);
+        axis_window(wq, kw, w_size, causal_w, ws[s], we[s]);
     }
 
     // Key span of the block: the first query's window start through the last
@@ -137,11 +157,11 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
     for (int nt = 0; nt < NT; ++nt) {
         o_acc[nt] = Mma::zero();
     }
-    float m_r[8], l_r[8];
+    float m_r[kAccRowsPerLane], l_r[kAccRowsPerLane];
     #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        m_r[e] = kNaNegInf;
-        l_r[e] = 0.0f;
+    for (int s = 0; s < kAccRowsPerLane; ++s) {
+        m_r[s] = kNaNegInf;
+        l_r[s] = 0.0f;
     }
 
     for (int tk = t_lo; tk < t_hi; ++tk) {
@@ -191,26 +211,46 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
                     }
                 }
 
-                // Masked online softmax. This lane holds score column wk0 + r for
-                // each of its accumulator rows.
-                const int wk = wk0 + r;
-                const bool in_tile = (wk - wk0) < n_valid_k;
-                float p_val[8], m_new[8];
+                // Masked online softmax. The accumulator element's column is the
+                // key, and on gfx9 it moves with `e` rather than being lane%16, so
+                // it has to be asked for per element. Every element that maps to
+                // one accumulator row shares that row's max and denominator, so
+                // the elements are folded together before the cross-lane reduce.
+                float p_val[Mma::kAccElems], m_new[kAccRowsPerLane];
                 #pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    const bool vis = in_tile && wk >= ws[e] && wk < we[e];
+                for (int e = 0; e < Mma::kAccElems; ++e) {
+                    const int wk = wk0 + acc_col(lane, e);
+                    const int s = acc_row_slot(e);
+                    const bool vis = (wk - wk0) < n_valid_k && wk >= ws[s] && wk < we[s];
                     p_val[e] = vis ? Mma::get(s_acc, e) * scale : kNaNegInf;
-                    m_new[e] = row_reduce_max(fmaxf(m_r[e], p_val[e]));
                 }
                 #pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    const float alpha = __expf(m_r[e] - m_new[e]);
-                    m_r[e] = m_new[e];
-                    p_val[e] = (p_val[e] <= kNaNegInf) ? 0.0f : __expf(p_val[e] - m_new[e]);
-                    l_r[e] = l_r[e] * alpha + row_reduce_sum(p_val[e]);
+                for (int s = 0; s < kAccRowsPerLane; ++s) {
+                    float local = m_r[s];
+                    #pragma unroll
+                    for (int e = 0; e < Mma::kAccElems; ++e) {
+                        if (acc_row_slot(e) == s) local = fmaxf(local, p_val[e]);
+                    }
+                    m_new[s] = row_reduce_max(local);
+                }
+                #pragma unroll
+                for (int s = 0; s < kAccRowsPerLane; ++s) {
+                    const float alpha = __expf(m_r[s] - m_new[s]);
+                    m_r[s] = m_new[s];
+                    float local = 0.0f;
+                    #pragma unroll
+                    for (int e = 0; e < Mma::kAccElems; ++e) {
+                        if (acc_row_slot(e) != s) continue;
+                        p_val[e] = (p_val[e] <= kNaNegInf) ? 0.0f : __expf(p_val[e] - m_new[s]);
+                        local += p_val[e];
+                    }
+                    l_r[s] = l_r[s] * alpha + row_reduce_sum(local);
                     #pragma unroll
                     for (int nt = 0; nt < NT; ++nt) {
-                        o_acc[nt][e] *= alpha;
+                        #pragma unroll
+                        for (int e = 0; e < Mma::kAccElems; ++e) {
+                            if (acc_row_slot(e) == s) o_acc[nt][e] *= alpha;
+                        }
                     }
                 }
 
@@ -218,8 +258,8 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
                 // and the accumulator gave this lane a column. The barrier below
                 // publishes the V transpose staged above as well.
                 #pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    sP[acc_row(lane, e) * LD + acc_col(lane)] = static_cast<Elem>(p_val[e]);
+                for (int e = 0; e < Mma::kAccElems; ++e) {
+                    sP[acc_row(lane, e) * LD + acc_col(lane, e)] = static_cast<Elem>(p_val[e]);
                 }
                 __syncthreads();
 
@@ -236,13 +276,13 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
 
     const int64_t orow = base + static_cast<int64_t>(t_q) * s_t + static_cast<int64_t>(h_q) * s_h;
     #pragma unroll
-    for (int e = 0; e < 8; ++e) {
+    for (int e = 0; e < Mma::kAccElems; ++e) {
         const int row = acc_row(lane, e);
         if (row >= n_valid_q) {
             continue;
         }
-        const float inv_l = 1.0f / fmaxf(l_r[e], 1e-30f);
-        Elem* dst = out + orow + static_cast<int64_t>(w0 + row) * s_w + acc_col(lane);
+        const float inv_l = 1.0f / fmaxf(l_r[acc_row_slot(e)], 1e-30f);
+        Elem* dst = out + orow + static_cast<int64_t>(w0 + row) * s_w + acc_col(lane, e);
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             dst[nt * 16] = static_cast<Elem>(Mma::get(o_acc[nt], e) * inv_l);
@@ -261,9 +301,12 @@ void launch_na3d_typed(
 
     using Elem = typename Mma::Elem;
     const dim3 grid((w_size + kNaQueries - 1) / kNaQueries, t_size * h_size, batch * num_heads);
+    // One wave per block, and kWave reads wave32 in this host pass even for a
+    // gfx9 build, so the block size comes from the device. See device_wave_size.
+    const int threads = device_wave_size();
 
 #define COMFY_NA3D_LAUNCH(HD_)                                                                 \
-    na3d_kernel<Mma, HD_><<<grid, kNaThreads, 0, stream>>>(                                    \
+    na3d_kernel<Mma, HD_><<<grid, threads, 0, stream>>>(                                       \
         reinterpret_cast<const Elem*>(q), reinterpret_cast<const Elem*>(k),                    \
         reinterpret_cast<const Elem*>(v), reinterpret_cast<Elem*>(out),                        \
         t_size, h_size, w_size, num_heads, s_b, s_t, s_h, s_w, s_n,                            \

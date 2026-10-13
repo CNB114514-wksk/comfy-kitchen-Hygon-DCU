@@ -29,10 +29,12 @@ function(_ck_read_arch_group output group_name)
 endfunction()
 
 _ck_read_arch_group(COMFY_HIP_ELEMENTWISE_ARCHS elementwise_only)
+_ck_read_arch_group(COMFY_HIP_MMAC_GFX9_ARCHS mmac_gfx9)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX11_ARCHS wmma_gfx11)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX12_ARCHS wmma_gfx12)
 set(COMFY_HIP_SUPPORTED_ARCHS
     ${COMFY_HIP_ELEMENTWISE_ARCHS}
+    ${COMFY_HIP_MMAC_GFX9_ARCHS}
     ${COMFY_HIP_WMMA_GFX11_ARCHS}
     ${COMFY_HIP_WMMA_GFX12_ARCHS}
 )
@@ -69,6 +71,7 @@ endfunction()
 
 _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
+_ck_make_arch_condition(COMFY_HIP_GFX9_CONDITION ${COMFY_HIP_MMAC_GFX9_ARCHS})
 set(_CK_HIP_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${_CK_HIP_GENERATED_INCLUDE_DIR}")
 configure_file(
@@ -200,6 +203,34 @@ target_compile_options(comfy_kitchen_hip_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>
 )
+
+# The Hygon v_mmac_* matrix builtins need their instruction-set features enabled.
+# The i8/b16 family needs mmop2-insts; the i4 family needs mmop3-insts and clang
+# rejects that builtin without it, on gfx928 included. gfx928 has mmop2 on by
+# default, gfx906/gfx938 do not. Added only when a gfx9 target is in the build, so
+# an RDNA-only build never sees the flags. The per-arch device passes that do not
+# know a feature just warn and ignore it; COMFY_MMA_GFX9 is undefined there, so no
+# mmac code is generated for them either way.
+#
+# Each feature is its own -target-feature pair: clang does not split a
+# comma-separated list, it treats "+a,+b" as one unknown feature name.
+#
+# The pairs go in as SHELL: entries. CMake de-duplicates target_compile_options,
+# so four separate -Xclang/-target-feature tokens would collapse to one and leave
+# "+mmop2-insts" and "+mmop3-insts" on the command line as stray file arguments.
+# One SHELL: item per feature keeps every argument and stays unique.
+foreach(_arch IN LISTS COMFY_HIP_ARCHS)
+    if(_arch IN_LIST COMFY_HIP_MMAC_GFX9_ARCHS)
+        set(_CK_BUILDS_GFX9 TRUE)
+    endif()
+endforeach()
+if(_CK_BUILDS_GFX9)
+    message(STATUS "Enabling mmop2-insts and mmop3-insts for the Hygon DCU matrix core")
+    target_compile_options(comfy_kitchen_hip_kernels PRIVATE
+        "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-Xclang -target-feature -Xclang +mmop2-insts>"
+        "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-Xclang -target-feature -Xclang +mmop3-insts>"
+    )
+endif()
 if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(
         comfy_kitchen_hip_kernels PRIVATE

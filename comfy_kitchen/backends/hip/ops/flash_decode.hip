@@ -17,6 +17,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <stdexcept>
 
 #include "../launchers.h"
 #include "../mma.h"
@@ -28,10 +29,10 @@ constexpr int kHeadDim = 128;
 constexpr int kDimPerLane = kHeadDim / kWave;
 constexpr int kCombineThreads = kHeadDim;
 
-// wave_sum below is a fixed wave32 DPP sequence, and four elements per lane is
-// what makes the head dimension divide evenly.
-static_assert(kWave == 32, "the reduction and the lane layout assume wave32");
-static_assert(kDimPerLane == 4, "a lane holds four elements of the head dim");
+// The head dimension is split evenly across the wave and closed with a full-wave
+// reduction, so it has to divide by the wave size: four elements per lane at
+// wave32 (RDNA), two at wave64 (the Hygon DCU).
+static_assert(kHeadDim % kWave == 0, "the head dim must divide evenly across the wave");
 
 // One wave per (batch, head, split) leaves too few waves to cover a cache miss,
 // and the split count is the caller's and capped. The waves of a block share a
@@ -71,6 +72,10 @@ __forceinline__ __device__ v4f load_bf16x4(const __bf16* p) {
 // __shfl_xor to ds_bpermute plus an LDS wait, five times per key per group,
 // which dominates once the group tile is wide. Bit-identical to that butterfly:
 // each step equalizes a wider span, so the next mirror acts as an xor swap.
+//
+// The DPP sequence below is a fixed wave32 one and gfx9 has no equivalent, so
+// there the portable butterfly is used instead -- slower, but the same sum.
+#if !defined(COMFY_MMA_GFX9)
 template <int Ctrl>
 __forceinline__ __device__ float dpp_add(float v) {
     const int bits = __builtin_bit_cast(int, v);
@@ -87,6 +92,9 @@ __forceinline__ __device__ float wave_sum(float v) {
                    float, __builtin_amdgcn_permlanex16(bits, bits, 0x76543210, 0xfedcba98, false,
                                                        false));
 }
+#else
+__forceinline__ __device__ float wave_sum(float v) { return wave_reduce_sum(v); }
+#endif
 
 // Splits partition [0, length). A split past the end still runs the epilogue:
 // the combine pass reads every slot and would otherwise read uninitialized
@@ -304,9 +312,12 @@ void launch_typed(const void* q, const void* k, const void* v, const int* kv_len
                   hipStream_t stream) {
     const dim3 grid(query_length / GroupsPerPass, num_splits, batch * heads);
     const int rows = batch * heads * query_length;
+    // kWavesPerBlock waves, and kWave reads wave32 in this host pass even for a
+    // gfx9 build, so the block size comes from the device.
+    const int threads = kWavesPerBlock * device_wave_size();
     const bool split = num_splits > 1;
     if (split) {
-        flash_decode_kernel<GroupsPerPass, true><<<grid, kBlockThreads, 0, stream>>>(
+        flash_decode_kernel<GroupsPerPass, true><<<grid, threads, 0, stream>>>(
             static_cast<const __bf16*>(q), static_cast<const __bf16*>(k),
             static_cast<const __bf16*>(v), kv_lengths, static_cast<__bf16*>(out), softmax_lse,
             out_accum, lse_accum, rows, query_length, heads, kv_capacity, num_splits,
@@ -316,7 +327,7 @@ void launch_typed(const void* q, const void* k, const void* v, const int* kv_len
             out_accum, lse_accum, static_cast<__bf16*>(out), softmax_lse, num_splits, rows,
             query_length, heads, q_batch_stride, q_row_stride, q_head_stride);
     } else {
-        flash_decode_kernel<GroupsPerPass, false><<<grid, kBlockThreads, 0, stream>>>(
+        flash_decode_kernel<GroupsPerPass, false><<<grid, threads, 0, stream>>>(
             static_cast<const __bf16*>(q), static_cast<const __bf16*>(k),
             static_cast<const __bf16*>(v), kv_lengths, static_cast<__bf16*>(out), softmax_lse,
             out_accum, lse_accum, rows, query_length, heads, kv_capacity, num_splits,

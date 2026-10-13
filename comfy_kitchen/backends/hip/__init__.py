@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HIP backend for AMD RDNA2, RDNA3/3.5 and RDNA4.
+"""HIP backend for AMD RDNA2, RDNA3/3.5 and RDNA4, and the Hygon DCU.
 
-Every matmul is a WMMA kernel compiled from the sources in this directory; the
-backend does not link or call hipBLAS/hipBLASLt.
+Every matmul is a matrix-core kernel compiled from the sources in this directory;
+the backend does not link or call hipBLAS/hipBLASLt.
 
-RDNA3 (gfx11xx) and RDNA4 (gfx12xx) have matrix cores and get everything. Their
-fragment layouts differ, and RDNA3 has no fp8 WMMA, so it widens fp8 to bf16;
-see mma.h.
+RDNA3 (gfx11xx) and RDNA4 (gfx12xx) have AMD's WMMA matrix cores and get
+everything. Their fragment layouts differ, and RDNA3 has no fp8 WMMA, so it
+widens fp8 to bf16; see mma.h.
+
+The Hygon DCU (gfx906/gfx928/gfx938) is a different instruction family: wave64
+and Hygon's v_mmac_* rather than v_wmma_*. Its kernels have their own bodies and
+are ported one at a time; mma.h's gfx9 policy is the reference for the layouts.
 
 RDNA2 (gfx103x) has no matrix cores. It runs the elementwise kernels (RoPE,
 AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and
@@ -169,24 +173,44 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
 
 
-# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
-# consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
-# compiler-recognized target needs its WMMA policy reviewed before it is safe.
+# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do, and so does the Hygon DCU
+# family, whose matrix core is Hygon's v_mmac_* rather than RDNA's v_wmma_*. This
+# exact manifest is also consumed by setup.py and CMake. Never infer support from
+# a gfx prefix: a new compiler-recognized target needs its WMMA policy reviewed
+# before it is safe.
+#
+# Having matrix cores and having a ported kernel for them are two different
+# things. The RDNA targets share one policy shape, so one group covers every
+# matrix-core kernel there. The Hygon DCU is a different instruction family and
+# was ported one kernel at a time; every matrix-core kernel it gates now has a
+# gfx9 body, so it joins the GEMM capability the same way it already joined the
+# INT8 attention one.
 _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
 _ARCH_GROUPS = json.loads(
     pathlib.Path(_ARCH_MANIFEST_PATH).read_text(encoding="utf-8")
 )
 _ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
+_ARCH_MMAC_GFX9 = frozenset(_ARCH_GROUPS["mmac_gfx9"])
 _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
-_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
-_ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
+# The AMD-WMMA families alone. A kernel whose only body is v_wmma_* runs on these
+# and nowhere else, which is what gates the ops the DCU has no ported body for.
+_ARCH_RDNA_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
+# The GEMMs and the other matrix-core kernels: RDNA3/3.5, RDNA4 and the Hygon
+# DCU, whose GEMM bodies are ported and verified (see mma.h's gfx9 policy).
+_ARCH_GEMM = _ARCH_RDNA_WMMA | _ARCH_MMAC_GFX9
+# The INT8 attention kernel, which is ported on all three families. The same set
+# today, kept separate because it is a distinct kernel gate that has been true of
+# the DCU for longer.
+_ARCH_INT8_ATTN = _ARCH_MMAC_GFX9 | _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
+_ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_GEMM
 
 # The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
 # or a scalar reduction and runs on any supported architecture. This set names the
-# registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
-# GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
-# which gates on has_wmma() itself rather than through the registry.
+# registry-dispatched matrix-core ops so _build_constraints can drop them on
+# RDNA2, the one supported family with no matrix core; the fp8 GEMM is not among
+# them because it is reached through scaled_mm_v2's _hip_fp8_gemm, which gates on
+# has_wmma() itself rather than through the registry.
 _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_linear",
@@ -196,6 +220,18 @@ _WMMA_ONLY_OPS = frozenset({
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
     "w4a8_int8_linear",
+})
+
+# The subset of _WMMA_ONLY_OPS whose only kernel body is AMD WMMA (v_wmma_*). The
+# Hygon DCU has a matrix core, so has_wmma() is true there, but these bodies were
+# never ported to it: they would run an RDNA kernel against the DCU's wave size and
+# fragment layout. Dropping them routes those ops to triton/eager while the ported
+# kernels still dispatch to HIP. fp16_conv3d/fp16_linear are the gemm_wmma fp16
+# path and sol_attn is the Sol-Attention family; the DCU has neither.
+_RDNA_WMMA_ONLY_OPS = frozenset({
+    "fp16_conv3d",
+    "fp16_linear",
+    "sol_attn",
 })
 
 
@@ -216,13 +252,34 @@ def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
 
 
 def _has_wmma(arches: Sequence[str | None]) -> bool:
-    """Whether every visible device has matrix cores.
+    """Whether every visible device has a ported matrix-core kernel.
 
     Registration is per-process while kernels launch on the tensor's own device, so
     the capability set has to be the intersection over the visible devices: one
     RDNA2 card in an otherwise RDNA4 box means no GEMM is safe to advertise.
     """
-    return bool(arches) and all(a in _ARCH_WMMA for a in arches)
+    return bool(arches) and all(a in _ARCH_GEMM for a in arches)
+
+
+def _has_rdna_wmma(arches: Sequence[str | None]) -> bool:
+    """Whether every visible device is an AMD-WMMA target.
+
+    True only when the AMD WMMA kernels -- the fp16 gemm_wmma path and the
+    Sol-Attention family -- are the ones that would run. The Hygon DCU has a
+    matrix core but no ported body for those, so this is strictly narrower than
+    _has_wmma() and is what gates them.
+    """
+    return bool(arches) and all(a in _ARCH_RDNA_WMMA for a in arches)
+
+
+def _has_int8_attn(arches: Sequence[str | None]) -> bool:
+    """Whether every visible device can run the INT8 attention kernel.
+
+    The same set as _has_wmma today, but kept separate: the Hygon DCU had this
+    kernel long before its GEMMs were ported, and the two gates are allowed to
+    drift apart again if a future kernel lands on one family first.
+    """
+    return bool(arches) and all(a in _ARCH_INT8_ATTN for a in arches)
 
 
 def is_available() -> bool:
@@ -230,7 +287,8 @@ def is_available() -> bool:
 
 
 def has_wmma() -> bool:
-    """Whether the GEMM kernels can run: every visible device has matrix cores.
+    """Whether the matrix-core GEMM kernels can run: every visible device has a
+    ported matrix core, AMD WMMA or Hygon v_mmac_*.
 
     is_available() is true on RDNA2 as well, where only the elementwise kernels
     exist, so callers that reach a GEMM without going through the registry (see
@@ -2330,7 +2388,7 @@ def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
 # Registration
 # ---------------------------------------------------------------------------
 
-def _build_constraints(has_wmma: bool = True) -> dict:
+def _build_constraints(has_wmma: bool = True, has_rdna_wmma: bool = True) -> dict:
     from comfy_kitchen.constraints import (
         DivisibleBy,
         ExactDims,
@@ -2712,6 +2770,11 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         # advertised. Dropping them here routes those ops to triton/eager while the
         # elementwise kernels below still dispatch to HIP.
         constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
+    elif not has_rdna_wmma:
+        # A DCU-only box: has_wmma() is true because the ported matrix-core kernels
+        # run, but the AMD-WMMA-only ops have no body here and must not be
+        # advertised either. Everything else in _WMMA_ONLY_OPS is ported.
+        constraints = {k: v for k, v in constraints.items() if k not in _RDNA_WMMA_ONLY_OPS}
 
     return constraints
 
@@ -2749,9 +2812,16 @@ def int8_attention_is_available() -> bool:
     """Whether the INT8 attention kernels can run here.
 
     Stricter than is_available(): the kernel is built on the matrix cores, so
-    RDNA2 declines it the way it declines the GEMMs.
+    RDNA2 declines it the way it declines the GEMMs. Looser than has_wmma(): the
+    Hygon DCU port covers the attention without covering the GEMMs, so gating on
+    has_wmma() would hide a kernel that is there.
     """
-    return has_wmma()
+    arches = _visible_gfx_arches()
+    return (
+        _EXT_AVAILABLE
+        and _unsupported_arch_reason(arches) is None
+        and _has_int8_attn(arches)
+    )
 
 
 def flash_attention_decode_is_available() -> bool:
@@ -2786,10 +2856,13 @@ def gated_delta_decode_is_available(key_head_dim: int = 128, value_head_dim: int
     """Whether the fused DeltaNet decode kernels can run here for these head dims.
 
     The kernels use no matrix cores, but they do use bf16 and fp16 arithmetic
-    throughout, so they draw the line where has_wmma() does, as the decode
-    attention kernel next door does.
+    throughout, so they need a target with the fp16 path, as the decode attention
+    kernel next door does. They are also laid out for a wave of 32 -- one wave
+    covers 32 value columns and the partition reduction indexes by kWave -- so they
+    decline on the Hygon DCU, whose waves are 64 wide. _has_rdna_wmma() is exactly
+    "every visible device is a wave32 AMD-WMMA target".
     """
-    if not has_wmma() or not hasattr(_C, "gated_delta_decode_fused"):
+    if not _has_rdna_wmma(_visible_gfx_arches()) or not hasattr(_C, "gated_delta_decode_fused"):
         return False
     if key_head_dim != _DELTA_KEY_DIM or value_head_dim <= 0 or value_head_dim > 512:
         return False
@@ -3070,7 +3143,7 @@ def _register():
     registry.register(
         name="hip",
         module=sys.modules[__name__],
-        capabilities=_build_constraints(has_wmma),
+        capabilities=_build_constraints(has_wmma, _has_rdna_wmma(arches)),
     )
     logger.debug(
         "registered HIP backend for %s (%s)",

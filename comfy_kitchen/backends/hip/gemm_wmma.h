@@ -231,17 +231,19 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 
     // Row-major writeback: the TN column tiles of one accumulator row cover
     // TN*16 consecutive columns, keeping the stores of an iteration contiguous.
-    const int col_lane = acc_col(lane);
+    // The element count and the row/column mapping are the policy's: wave32 RDNA
+    // holds eight elements with a fixed column, the wave64 DCU four with the
+    // column moving with `e`. See Mma::kAccElems / acc_row / acc_col in mma.h.
     #pragma unroll
     for (int i = 0; i < TM; ++i) {
         #pragma unroll
-        for (int e = 0; e < 8; ++e) {
+        for (int e = 0; e < Mma::kAccElems; ++e) {
             const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
             if (r >= M) continue;
             OutT* crow = C + static_cast<int64_t>(r) * ldc;
             #pragma unroll
             for (int j = 0; j < TN; ++j) {
-                const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+                const int col = n0 + wn * (TN * 16) + j * 16 + acc_col(lane, e);
                 if (col >= N) continue;
                 crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
             }
@@ -289,6 +291,16 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
 
     const int wgps = device_wgp_count();
 
+    // A wave is one warp and owns one 16x16 tile, so the warp grid (WARPS_M x
+    // WARPS_N) is the same on both families; only lanes-per-wave differs (wave32
+    // on RDNA, wave64 on the Hygon DCU). The block size is therefore the warp
+    // count times the *device's* wave size: kWave is a device-pass constant and
+    // reads wave32 in this host pass even for a gfx9 build. See device_wave_size.
+    const int wave = device_wave_size();
+    const int kThreads44 = 4 * 4 * wave;
+    const int kThreads42 = 4 * 2 * wave;
+    const int kThreads22 = 2 * 2 * wave;
+
     // Zero padding the block count cannot see: at M <= 64 the 128-row tile is at
     // least half empty, and the finer 64x64 grid recovers the wasted MMAs.
     const bool skinny = (M <= 64 || N <= 64);
@@ -301,27 +313,27 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
             // the 16-wave grid hides latency within a block instead.
             if (blocks_128 <= 4 * wgps) {
                 gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
-                    <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+                    <<<grid, kThreads44, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
             } else {
                 gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
-                    <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+                    <<<grid, kThreads42, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
             }
         } else {
             constexpr int BM = 128, BN = 128, BKB = 64;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
             gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
-                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+                <<<grid, kThreads42, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
         }
     } else if (kbytes >= 2048) {
         constexpr int BM = 64, BN = 64, BKB = 128;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            <<<grid, kThreads22, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
     } else {
         constexpr int BM = 64, BN = 64, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            <<<grid, kThreads22, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
     }
 }
 

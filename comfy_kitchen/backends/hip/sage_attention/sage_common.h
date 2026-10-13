@@ -22,10 +22,17 @@ namespace comfy::hip_backend::sage {
 
 // Every kernel here indexes lanes with & 31, reduces with a width of 32 and packs
 // fragments per half wave. RDNA defaults to wave32, but -mwavefrontsize64 would
-// compile all of that into silently wrong scales rather than an error.
+// compile all of that into silently wrong scales rather than an error. The Hygon
+// DCU is the other way round: wave64 always, and its mmac accumulator hands a
+// lane one row and four columns four apart, so the lane math differs there.
 #if defined(__AMDGCN_WAVEFRONT_SIZE__)
+#if defined(COMFY_MMA_GFX9)
+static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 64,
+              "the gfx9 int8 attention kernels are wave64");
+#else
 static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 32,
               "the int8 attention kernels are wave32 only");
+#endif
 #endif
 
 // Softmax probabilities are unsigned int8, so the online maximum is shifted far
@@ -115,6 +122,12 @@ __forceinline__ __device__ void store4_i8(int8_t* p, int8_t a, int8_t b, int8_t 
 __forceinline__ __device__ uint32_t swap_half_wave_b32(uint32_t v) {
     return static_cast<uint32_t>(__builtin_amdgcn_permlanex16(
         static_cast<int>(v), static_cast<int>(v), 0x76543210, 0xfedcba98, false, false));
+}
+#elif defined(COMFY_MMA_GFX9)
+// wave64: the partner set is the other 32-lane half, so the exchange mask is 32,
+// not 16. Same purpose -- fold the two halves that split the keys of one query.
+__forceinline__ __device__ uint32_t swap_half_wave_b32(uint32_t v) {
+    return static_cast<uint32_t>(__shfl_xor(static_cast<int>(v), 32, 64));
 }
 #else
 __forceinline__ __device__ uint32_t swap_half_wave_b32(uint32_t v) {
@@ -246,7 +259,16 @@ __forceinline__ __device__ uint32_t prob_to_u8(float p) {
 __forceinline__ __device__ MmaInt8::Frag pack_prob_frag(const uint32_t p[8], int lane) {
     const uint32_t lo = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
     const uint32_t hi = p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24);
-#if !defined(COMFY_MMA_GFX11)
+#if defined(COMFY_MMA_GFX9)
+    // The DCU's P fragment is a single packed 64-bit value, not a subscriptable
+    // v2i, and its accumulator layout is a different shape besides, so this repack
+    // does not describe a correct DCU fragment. Nothing on the DCU calls it -- the
+    // gfx9 attention builds its own P -- but the Sol-Attention translation units
+    // include this header, so it has to compile.
+    (void)lane;
+    return static_cast<MmaInt8::Frag>(static_cast<uint64_t>(lo)) |
+           (static_cast<MmaInt8::Frag>(static_cast<uint64_t>(hi)) << 32);
+#elif !defined(COMFY_MMA_GFX11)
     // gfx12, and the no-matrix-core stub, whose Frag is this narrow too.
     (void)lane;
     MmaInt8::Frag f;

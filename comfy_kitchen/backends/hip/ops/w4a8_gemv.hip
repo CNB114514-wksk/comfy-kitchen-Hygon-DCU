@@ -146,7 +146,11 @@ extern "C" bool launch_w4a8_codebook_gemv_kernel(
     // Same epilogue object the INT8 GEMM builds, so the two paths round alike.
     EpiRowwise epi{static_cast<const float*>(xs), static_cast<const float*>(s_channel), 1, bias,
                    bias_code};
-    const dim3 block(kWave * kW4a8GemvWaves);
+    // kWave is the device-pass constant: it is 32 in the host pass even on a gfx9
+    // build, while the kernel body below maps columns with the wave it actually
+    // runs on. Sizing the block from kWave would launch half the threads the
+    // tid/kWave mapping needs on the Hygon DCU and leave the upper columns unwritten.
+    const dim3 block(device_wave_size() * kW4a8GemvWaves);
     const dim3 grid(static_cast<unsigned int>((N + kW4a8GemvWaves - 1) / kW4a8GemvWaves));
 
 #define CK_W4A8_GEMV_LAUNCH(OutT)                                                              \

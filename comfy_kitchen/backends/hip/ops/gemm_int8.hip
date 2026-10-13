@@ -14,7 +14,7 @@ namespace comfy::hip_backend {
 
 // Small-M path: reduce K across the wave, one wave per output column.
 template <typename OutT>
-__global__ __launch_bounds__(256) void gemv_int8_kernel(
+__global__ __launch_bounds__(kWave * 8) void gemv_int8_kernel(
     const int8_t* __restrict__ A, const int8_t* __restrict__ B, OutT* __restrict__ C,
     int M, int N, int K, int ldc, EpiRowwise epi) {
 
@@ -50,7 +50,9 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
     const uint8_t* Bu = reinterpret_cast<const uint8_t*>(B);
 
     if (M <= 8) {
-        dim3 block(kWave, 8);
+        // One wave reduces one output column, so the x dimension has to be the
+        // device's wave size, not the host pass's wave32 kWave.
+        dim3 block(device_wave_size(), 8);
         dim3 grid((N + 7) / 8, M);
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;

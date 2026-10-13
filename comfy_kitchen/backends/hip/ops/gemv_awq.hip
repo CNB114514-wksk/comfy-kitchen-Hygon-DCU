@@ -92,7 +92,9 @@ extern "C" void launch_gemv_awq_kernel(
                                  " must be a multiple of group_size=" + std::to_string(group_size));
     }
 
-    dim3 block(kWave, kAwqWavesPerBlock);
+    // One wave reduces one output column, and a wave is the device's wave size
+    // (64 on the Hygon DCU), not the host pass's wave32 kWave.
+    dim3 block(device_wave_size(), kAwqWavesPerBlock);
     dim3 grid((N + kAwqWavesPerBlock - 1) / kAwqWavesPerBlock, M);
     const int8_t* q = static_cast<const int8_t*>(qweight);
 

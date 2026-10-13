@@ -33,21 +33,24 @@ template <typename OutT>
 static void launch_w4a4(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
                         EpiRowwise epi, hipStream_t stream) {
     const int kbytes = K / 2;
+    // A block is one wave per 16x16 tile of the warp grid, and kWave reads wave32
+    // in this host pass even for a gfx9 build, so the size comes from the device.
+    const int wave = device_wave_size();
     if (M >= 512 && N >= 128 && K > N) {
         constexpr int BM = 256, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
+            <<<grid, 4 * 2 * wave, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
     } else if (M >= 96 && N >= 96) {
         constexpr int BM = 128, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 2, 4>
-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
+            <<<grid, 4 * 2 * wave, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
     } else {
         constexpr int BM = 64, BN = 64, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 2, 2, 2, 2>
-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
+            <<<grid, 2 * 2 * wave, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
     }
 }
 
