@@ -37,6 +37,11 @@ family, so each kernel has to be ported individually. This fork adds that path.
   `gfx938` do not. The flags are added only when a gfx9 target is in the build.
 - **i4 caveat:** the i4 (`mmop3`) family *compiles* with clang but **traps on the
   silicon**, so int4 ops run through an **int8 fallback**.
+- **fp8 caveat:** gfx9 has **no fp8 matrix instruction**. `gemm_fp8` still compiles
+  and dispatches, but `mma.h` widens the fp8 operands to bf16, so it is an fp8-*storage* /
+  bf16-*compute* path — not fp8 compute. Do not expect a speedup from fp8 over
+  bf16 on this target; the quantized path that actually uses the matrix core here
+  is int8.
 - **Unsigned operands:** `u8` MMAC requires *both* operands unsigned.
 - **Wave size:** `kWave` is 32 in host passes on this target; launch
   configurations must use the *device* wave size, not the host value.
