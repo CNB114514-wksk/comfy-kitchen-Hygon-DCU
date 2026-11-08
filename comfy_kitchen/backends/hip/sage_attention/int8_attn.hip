@@ -916,6 +916,15 @@ constexpr int kScoreTiles9 = kCtaK9 / 16;
 // of a wave on sixteen distinct bank pairs.
 constexpr int kStrideP9 = kCtaK9 + 4;
 
+// p is exp2(score - tile_m) and tile_m is the query group's maximum shifted
+// down by kProbU8Offset, so p never leaves [0, 2^kProbU8Offset] -- 254.66 at the
+// very top. prob_to_u8's clamp to [0, 255] therefore cannot fire on this path and
+// only its round-to-nearest-even survives; the leading clamp is one v_med3 per
+// probability and there are eight of them.
+__forceinline__ __device__ uint32_t prob_to_u8_9(float p) {
+    return static_cast<uint32_t>(rintf(p));
+}
+
 // Fold one query's group: the four lanes with the same l%16, i.e. l/16 = 0..3.
 // XOR with 16 and 32 stays inside that group because both preserve the low four
 // bits, which carry the query index.
@@ -980,6 +989,22 @@ __global__ __launch_bounds__(kThreads9) void int8_attn_kernel(
     // the original mask). The prepared key/dense layouts are gated off for gfx9
     // on the host, so any non-None mask here is read through mask_keep.
     constexpr bool kCustomMask = kMask != MaskMode::kNone;
+
+    // The PV dequantization used to convert each of the 32 accumulator lanes to
+    // FP32 and then subtract the V bias it added during staging. Adding a signed
+    // integer x to these bits instead yields the exact FP32 value 12582912 + x
+    // for any |x| <= 2^22, so seeding the MMA accumulator with it makes the
+    // bitcast to float free: the convert disappears and the bias comes out in the
+    // same subtract that removed v_bias. Upstream gfx12 keeps this behind kBiasPV;
+    // the bound holds here too, since P and the stage-biased V are both U8, so a
+    // K=32 tile is at most 32 * 255 * 255.
+    static_assert(kCtaK9 * 255 * 255 < (1 << 22),
+                  "int-bias PV dequantization needs the accumulator to stay exact");
+    constexpr int kIntBias9 = 0x4b400000;
+    constexpr float kFloatBias9 = 12582912.0f;
+    typename MmaInt8::Acc pv_bias_acc = {kIntBias9, kIntBias9, kIntBias9, kIntBias9};
+    // Materialize once, outside the key loop, rather than per iteration.
+    asm volatile("" : "+v"(pv_bias_acc));
 
     // K key-major, V channel-major -- each the order it already has in global.
     // P is per wave: 16 queries by 32 keys, staged so the second MMA reads a
@@ -1148,54 +1173,70 @@ __global__ __launch_bounds__(kThreads9) void int8_attn_kernel(
         // The tile maximum's gap to the running one rides on the accumulator side
         // as p_scale, which underflows to zero for a fully masked tile.
         const float m_prev = m_run;
-        const float smaller = exp2f(-fabsf(m_prev - tile_m));
+        // gfx9/ftz exponential: the argument is at most 0, so this can only ever
+        // land in the subnormal range, where o_scale is already far below the
+        // accumulator's resolution. exp2f's subnormal correction is wasted work.
+        const float smaller = softmax_exp2(-fabsf(m_prev - tile_m));
         const float o_scale = m_prev < tile_m ? smaller : 1.0f;
         const float p_scale = tile_m < m_prev ? smaller : 1.0f;
         m_run = fmaxf(m_prev, tile_m);
-        d_run *= o_scale;
+        // A lane whose tile did not raise the maximum has o_scale == 1, and
+        // multiplying by 1 is exact, so the whole rescale can ride on the wave's
+        // vote: in the steady state of a long sequence almost no iteration raises
+        // the maximum, and the 32 FP32 multiplies drop out of the emitted stream
+        // for all of them. tile_m is folded across a query's four lanes, so the
+        // four lanes of one query always agree; the vote only merges the 16
+        // queries that share a wave.
+        if (__any(tile_m > m_prev ? 1 : 0)) {
+            d_run *= o_scale;
 #pragma unroll
-        for (int dt = 0; dt < kOutTiles; ++dt) {
+            for (int dt = 0; dt < kOutTiles; ++dt) {
 #pragma unroll
-            for (int e = 0; e < 4; ++e) o_val[dt][e] *= o_scale;
+                for (int e = 0; e < 4; ++e) o_val[dt][e] *= o_scale;
+            }
         }
 
         // --- probabilities: exp2, then stage P for the second MMA ---
         // The shift by kProbU8Offset fills the unsigned INT8 range, and it cancels
         // between the numerator and the denominator, so both carry it.
         float tile_sum = 0.0f;
-        float p_rowsum = 0.0f;
+        // Accumulated as an integer: eight values below 256 sum to at most 2040,
+        // so the float sum this replaces was exact anyway, and the integer form
+        // drops one v_cvt per probability.
+        int p_rowsum = 0;
         const float neg_m = -tile_m;
 #pragma unroll
         for (int t = 0; t < kScoreTiles9; ++t) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                const float p = exp2f(sc[t][e] + neg_m);
+                const float p = softmax_exp2(sc[t][e] + neg_m);
                 tile_sum += p;
-                const uint32_t q8 = prob_to_u8(p);
-                p_rowsum += static_cast<float>(q8);
+                const uint32_t q8 = prob_to_u8_9(p);
+                p_rowsum += static_cast<int>(q8);
                 p_wave[q_lane * kStrideP9 + 16 * t + 4 * e + g] = static_cast<uint8_t>(q8);
             }
         }
         d_run += query_group_sum9(tile_sum) * p_scale;
         // The bias the V staging added, in the accumulator's own units: 128 times
         // this query's quantized probabilities summed over all 32 keys.
-        const float v_bias = 128.0f * query_group_sum9(p_rowsum);
+        const float v_bias = 128.0f * query_group_sum9(static_cast<float>(p_rowsum));
 
         // Every lane of the group wrote P at an offset another lane reads, so the
         // wave has to be ordered before the second MMA.
         __syncthreads();
 
         // --- output: O += P @ V, one MMA per 16-channel tile (K = 32) ---
+        // v_bias rides on the accumulator's 12582912 offset, so the FP32
+        // conversion of each accumulator lane is a bitcast rather than a convert.
+        const float pv_bias = kFloatBias9 + v_bias;
 #pragma unroll
         for (int dt = 0; dt < kOutTiles; ++dt) {
             typename MmaInt8::Acc partial = MmaInt8::mma_ub(
                 load_frag_b64_a(p_wave, q_lane, 0, kStrideP9, lane),
-                load_frag_b64_a(smem_v, dt * 16 + q_lane, 0, kStrideV, lane),
-                MmaInt8::zero());
+                load_frag_b64_a(smem_v, dt * 16 + q_lane, 0, kStrideV, lane), pv_bias_acc);
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                o_val[dt][e] =
-                    fmaf(static_cast<float>(partial[e]) - v_bias, p_scale, o_val[dt][e]);
+                o_val[dt][e] = fmaf(__int_as_float(partial[e]) - pv_bias, p_scale, o_val[dt][e]);
             }
         }
     };
