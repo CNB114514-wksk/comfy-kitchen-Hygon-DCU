@@ -29,14 +29,23 @@ logger = logging.getLogger("comfy_kitchen.sage_attention")
 
 # The fused INT8 path has to quantize Q, K and V before the attention kernel can
 # start, and that preamble does not shrink with the sequence. Below some length
-# per segment the preamble costs more than the faster kernel saves: on gfx9 at
-# q_len == kv_len, 4096 tokens ran 1.81x slower than SDPA and 35880 tokens ran
-# 1.28x faster. The default is the first power of two above the measured loss and
-# well below the measured win, so it discards the losses without being trusted
-# about the wins. A sweep has to place the real crossover, and the variable can
-# then raise it without a rebuild.
+# per segment the preamble costs more than the faster kernel saves. On gfx9 with
+# q_len == kv_len the measured points are:
+#
+#   4096 tokens   1.81x slower than SDPA
+#   16384 tokens  1.39x slower
+#   32760 tokens  1.12x slower   (Wan2.1-I2V-14B-480P, 832x480 x 81 frames)
+#   35880 tokens  1.28x faster
+#
+# so the crossover sits near 35.8k and everything at or below 32760 loses. The
+# default is set at the measured break-even: 35840 is above every measured loss
+# (9.4% of headroom over 32760) and still below the measured win, so the gated
+# path never takes a known regression and only engages where a gain has actually
+# been seen. It is a multiple of 512, which keeps it on a tile boundary if the
+# kernel's tiling is ever tied to it. The variable can move the threshold
+# without a rebuild; a finer sweep would only refine the 32760..35880 window.
 _INT8_MIN_QK_ENV = "COMFY_KITCHEN_INT8_MIN_QK"
-_INT8_MIN_QK_DEFAULT = 8192
+_INT8_MIN_QK_DEFAULT = 35840
 _int8_min_qk_cache: tuple[str | None, int] | None = None
 _int8_gate_reported = False
 
@@ -765,7 +774,8 @@ def int8_attention(
     The path only pays for itself on long sequences: quantizing Q, K and V is a
     fixed cost per call that the faster kernel has to earn back. On the HIP
     backend a call with q_len * kv_len below COMFY_KITCHEN_INT8_MIN_QK squared
-    (default 8192 per segment) therefore runs as scaled_dot_product_attention
+    (default 35840 per segment, the measured break-even) therefore runs as
+    scaled_dot_product_attention
     with the caller's mask and scale, which is the same thing the flash baseline
     computes. Set that variable to 0 to take the INT8 path unconditionally.
     """
