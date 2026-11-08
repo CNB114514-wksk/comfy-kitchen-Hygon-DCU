@@ -10,8 +10,13 @@
 // fragment both index keys in natural order (see int8_attn.h), so keys are
 // written where they belong and the tail is zero filled.
 //
-// One block per (b, h, d_tile) of 8 channels. Pass 1 reduces the per-channel
-// absmax along N with 4x unrolled vector loads, pass 2 quantizes.
+// One block per (b, h, d_tile) of kDTile channels. Pass 1 reduces the per-channel
+// absmax along N, pass 2 quantizes. Both walk four consecutive keys per thread,
+// which is what makes a lane cover whole 32-byte sectors: one key per thread read
+// 16 bytes of a sector and wrote one byte per lane, so the quantize pass settled
+// 32 bytes per store instruction and the store pipe, not the memory system, set
+// the pace. Four keys per thread also let each channel leave as a single 4-byte
+// store.
 #include <hip/hip_runtime.h>
 
 #include <stdexcept>
@@ -22,27 +27,36 @@
 namespace comfy::hip_backend::sage {
 namespace {
 
-constexpr int kDTile = 8;
+// Sixteen channels: 64 bytes of fp32 or 32 of a 16-bit type. Eight channels left
+// the 16-bit types loading 16 bytes, half a sector, so every load pass fetched
+// twice what it used.
+constexpr int kDTile = 16;
+// Four keys per thread, so a channel's four quantized bytes leave together.
+constexpr int kKeysPerThread = 4;
 
-// Eight adjacent channels: 32 bytes for fp32, 16 for the 16-bit types.
+// kDTile adjacent channels: 64 bytes for fp32, 32 for the 16-bit types. The
+// caller guarantees the group is in bounds and 16-byte aligned.
 template <typename T>
-__forceinline__ __device__ void load8(const T* p, float* out) {
+__forceinline__ __device__ void load16(const T* p, float* out) {
     if constexpr (std::is_same_v<T, float>) {
-        const float4 lo = *reinterpret_cast<const float4*>(p);
-        const float4 hi = *reinterpret_cast<const float4*>(p + 4);
-        out[0] = lo.x;
-        out[1] = lo.y;
-        out[2] = lo.z;
-        out[3] = lo.w;
-        out[4] = hi.x;
-        out[5] = hi.y;
-        out[6] = hi.z;
-        out[7] = hi.w;
-    } else {
-        const uint4 raw = *reinterpret_cast<const uint4*>(p);
-        const T* vals = reinterpret_cast<const T*>(&raw);
+        const float4* raw = reinterpret_cast<const float4*>(p);
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) out[i] = to_float(vals[i]);
+        for (int i = 0; i < kDTile / 4; ++i) {
+            const float4 part = raw[i];
+            out[i * 4 + 0] = part.x;
+            out[i * 4 + 1] = part.y;
+            out[i * 4 + 2] = part.z;
+            out[i * 4 + 3] = part.w;
+        }
+    } else {
+        const uint4* raw = reinterpret_cast<const uint4*>(p);
+#pragma unroll
+        for (int i = 0; i < kDTile / 8; ++i) {
+            const uint4 part = raw[i];
+            const T* vals = reinterpret_cast<const T*>(&part);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) out[i * 8 + j] = to_float(vals[j]);
+        }
     }
 }
 
@@ -67,25 +81,30 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
 #pragma unroll
     for (int i = 0; i < kDTile; ++i) mx[i] = 0.0f;
 
-    // Four independent loads per iteration so the memory system has something to
-    // overlap; this block is the only one touching these channels.
-    int n = threadIdx.x;
-    const int n_body = N - 3 * Threads;
-    for (; n < n_body; n += 4 * Threads) {
+    // A thread owns one group of kKeysPerThread adjacent keys per step; the four
+    // loads it issues are independent, so the memory system has something to
+    // overlap. This block is the only one touching these channels.
+    const int groups = N / kKeysPerThread;
+    const int residue = N - groups * kKeysPerThread;
+    for (int g = threadIdx.x; g < groups; g += Threads) {
+        const int n = g * kKeysPerThread;
         float t0[kDTile], t1[kDTile], t2[kDTile], t3[kDTile];
-        load8<T>(base + static_cast<int64_t>(n) * stride_n, t0);
-        load8<T>(base + static_cast<int64_t>(n + Threads) * stride_n, t1);
-        load8<T>(base + static_cast<int64_t>(n + 2 * Threads) * stride_n, t2);
-        load8<T>(base + static_cast<int64_t>(n + 3 * Threads) * stride_n, t3);
+        load16<T>(base + static_cast<int64_t>(n) * stride_n, t0);
+        load16<T>(base + static_cast<int64_t>(n + 1) * stride_n, t1);
+        load16<T>(base + static_cast<int64_t>(n + 2) * stride_n, t2);
+        load16<T>(base + static_cast<int64_t>(n + 3) * stride_n, t3);
 #pragma unroll
         for (int i = 0; i < kDTile; ++i) {
             mx[i] = fmaxf(mx[i], fmaxf(fmaxf(fabsf(t0[i]), fabsf(t1[i])),
                                        fmaxf(fabsf(t2[i]), fabsf(t3[i]))));
         }
     }
-    for (; n < N; n += Threads) {
+    // The keys past the last whole group: at most three, one per thread, and
+    // each of them belongs to exactly one thread because the step above is a
+    // whole number of groups.
+    if (threadIdx.x < residue) {
         float t[kDTile];
-        load8<T>(base + static_cast<int64_t>(n) * stride_n, t);
+        load16<T>(base + static_cast<int64_t>(groups * kKeysPerThread + threadIdx.x) * stride_n, t);
 #pragma unroll
         for (int i = 0; i < kDTile; ++i) mx[i] = fmaxf(mx[i], fabsf(t[i]));
     }
@@ -120,13 +139,32 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
 
     const int64_t out_row = (static_cast<int64_t>(b) * H + h) * D + d0;
 
-    // Descending so the tail of pass 1 is still in L2 when pass 2 starts.
-    for (int src = N - 1 - static_cast<int>(threadIdx.x); src >= 0; src -= Threads) {
-        float t[kDTile];
-        load8<T>(base + static_cast<int64_t>(src) * stride_n, t);
+    // Descending so the tail of pass 1 is still in L2 when pass 2 starts. Four
+    // keys per store: a channel row is written 4 bytes per lane, 256 bytes per
+    // wave, instead of 1 byte per lane.
+    for (int g = groups - 1 - static_cast<int>(threadIdx.x); g >= 0; g -= Threads) {
+        const int n = g * kKeysPerThread;
+        float t0[kDTile], t1[kDTile], t2[kDTile], t3[kDTile];
+        load16<T>(base + static_cast<int64_t>(n) * stride_n, t0);
+        load16<T>(base + static_cast<int64_t>(n + 1) * stride_n, t1);
+        load16<T>(base + static_cast<int64_t>(n + 2) * stride_n, t2);
+        load16<T>(base + static_cast<int64_t>(n + 3) * stride_n, t3);
 #pragma unroll
         for (int i = 0; i < kDTile; ++i) {
-            out[(out_row + i) * padded_N + src] = float_to_int8_rn(t[i] * inv_scale[i]);
+            store4_i8(&out[(out_row + i) * padded_N + n], quant_int8_rcp(t0[i], inv_scale[i]),
+                      quant_int8_rcp(t1[i], inv_scale[i]), quant_int8_rcp(t2[i], inv_scale[i]),
+                      quant_int8_rcp(t3[i], inv_scale[i]));
+        }
+    }
+    // The keys past the last whole group cannot form a 4-byte store, so they go
+    // out one byte at a time.
+    if (threadIdx.x < residue) {
+        const int src = groups * kKeysPerThread + threadIdx.x;
+        float t[kDTile];
+        load16<T>(base + static_cast<int64_t>(src) * stride_n, t);
+#pragma unroll
+        for (int i = 0; i < kDTile; ++i) {
+            out[(out_row + i) * padded_N + src] = quant_int8_rcp(t[i], inv_scale[i]);
         }
     }
 
@@ -177,8 +215,17 @@ extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, 
             "sage int8 attention: V base pointer and B/H/N strides must be 16-byte aligned");
     }
     if (D <= 0 || D % kDTile != 0) {
+        throw std::runtime_error(std::string("sage int8 attention: head_dim must be a positive "
+                                                    "multiple of ") +
+                                 std::to_string(kDTile));
+    }
+    // The quantize pass writes four adjacent keys at a time through store4_i8,
+    // so the row base has to be 4-byte aligned and a row has to be a whole
+    // number of 4-byte groups. Rows are padded_N wide and start at a channel
+    // boundary, which leaves the base pointer and the padding to check.
+    if (reinterpret_cast<uintptr_t>(out) % 4 != 0 || padded_N % 4 != 0) {
         throw std::runtime_error(
-            "sage int8 attention: head_dim must be a positive multiple of 8");
+            "sage int8 attention: V int8 output must be 4-byte aligned in both dimensions");
     }
     // Rows are padded_N wide and the quantize pass writes columns up to N, so a
     // short pad would run every row past its end.
