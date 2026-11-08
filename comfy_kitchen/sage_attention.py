@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -22,6 +24,30 @@ CTA_K = 64
 LARGE_CTA_K = 128
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 _NATIVE_MINIMUM_CAPABILITY = (7, 5)
+
+logger = logging.getLogger("comfy_kitchen.sage_attention")
+
+# The fused INT8 path has to quantize Q, K and V before the attention kernel can
+# start, and that preamble does not shrink with the sequence. Below some length
+# per segment the preamble costs more than the faster kernel saves. On gfx9 with
+# q_len == kv_len the measured points are:
+#
+#   4096 tokens   1.81x slower than SDPA
+#   16384 tokens  1.39x slower
+#   32760 tokens  1.12x slower   (Wan2.1-I2V-14B-480P, 832x480 x 81 frames)
+#   35880 tokens  1.28x faster
+#
+# so the crossover sits near 35.8k and everything at or below 32760 loses. The
+# default is set at the measured break-even: 35840 is above every measured loss
+# (9.4% of headroom over 32760) and still below the measured win, so the gated
+# path never takes a known regression and only engages where a gain has actually
+# been seen. It is a multiple of 512, which keeps it on a tile boundary if the
+# kernel's tiling is ever tied to it. The variable can move the threshold
+# without a rebuild; a finer sweep would only refine the 32760..35880 window.
+_INT8_MIN_QK_ENV = "COMFY_KITCHEN_INT8_MIN_QK"
+_INT8_MIN_QK_DEFAULT = 35840
+_int8_min_qk_cache: tuple[str | None, int] | None = None
+_int8_gate_reported = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +89,116 @@ def _select_cta_k(
     if not has_mask and kernel_head_dim >= 128 and kv_length > 1024:
         return LARGE_CTA_K
     return CTA_K
+
+
+def _int8_min_qk() -> int:
+    """Minimum segment length for the INT8 path, from the environment.
+
+    Read per call rather than at import so that one process can compare the
+    gated and ungated paths by flipping the variable between runs; the parse is
+    cached against the raw string, which keeps the steady-state cost to a dict
+    lookup. A bad value falls back to the default instead of raising: a tuning
+    knob is not worth failing an inference over, and 0 -- the documented way to
+    restore the old unconditional behaviour -- parses cleanly anyway.
+    """
+    global _int8_min_qk_cache
+    raw = os.environ.get(_INT8_MIN_QK_ENV)
+    if _int8_min_qk_cache is None or _int8_min_qk_cache[0] != raw:
+        value = _INT8_MIN_QK_DEFAULT
+        if raw is not None:
+            try:
+                value = max(0, int(raw))
+            except ValueError:
+                logger.warning(
+                    "ignoring non-integer %s=%r, using %d",
+                    _INT8_MIN_QK_ENV,
+                    raw,
+                    _INT8_MIN_QK_DEFAULT,
+                )
+        _int8_min_qk_cache = (raw, value)
+    return _int8_min_qk_cache[1]
+
+
+def _int8_sequence_too_short(q: torch.Tensor, k: torch.Tensor) -> bool:
+    """Whether this Q/K pair is shorter than the INT8 path crossover.
+
+    The comparison is q_len * kv_len < threshold ** 2, i.e. the geometric mean
+    of the two lengths against a length. Every shape that was measured was
+    square, where that reduces to 'sequence length below the threshold'; the mean
+    is what keeps the asymmetric case honest. The text segment of a block-causal
+    image model is a few dozen queries over a few thousand keys: the product
+    alone would put it far above any threshold and keep quantizing thousands of
+    V rows to answer forty queries, while min() would gate on the wrong side of
+    long-query/short-key attention.
+    """
+    threshold = _int8_min_qk()
+    if threshold <= 0:
+        return False
+    q_length = q.shape[2]
+    kv_length = k.shape[2]
+    if q_length * kv_length >= threshold * threshold:
+        return False
+    global _int8_gate_reported
+    if not _int8_gate_reported:
+        # Once per process: this fires on every layer of every step, and the
+        # decision only changes if the variable does.
+        _int8_gate_reported = True
+        logger.info(
+            "[comfy_kitchen] int8 disabled: q*kv=%d (%d x %d, ~%.0f tokens) < "
+            "threshold=%d^2; falling back to SDPA",
+            q_length * kv_length,
+            q_length,
+            kv_length,
+            math.sqrt(q_length * kv_length),
+            threshold,
+        )
+    return True
+
+
+def _int8_gated(q: torch.Tensor, k: torch.Tensor) -> bool:
+    """Whether to keep this call off the INT8 path entirely.
+
+    Only the shapes the INT8 path accepts are gated, so anything malformed still
+    reaches the validation in _int8_attention_cuda and fails with the error that
+    names the real problem. The gate is deliberately HIP-only: the threshold
+    comes from gfx9 measurements, and silently moving CUDA's small shapes onto
+    SDPA would stop its own kernels being exercised there at all.
+    """
+    return (
+        _hip_backend is not None
+        and q.ndim == 4
+        and k.ndim == 4
+        and q.dtype in _SUPPORTED_DTYPES
+        and q.shape[1] % k.shape[1] == 0
+        and _int8_sequence_too_short(q, k)
+    )
+
+
+def _sdpa_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float | None,
+    attn_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Run a gated call as plain SDPA.
+
+    This is the call the flash baseline makes, with the mask untouched and the
+    same scale, so a gated call is numerically identical to a run that never had
+    an INT8 path: the gate can change the timing, never the output.
+    """
+    head_dim = q.shape[-1]
+    return functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        scale=head_dim**-0.5 if scale is None else float(scale),
+        # The INT8 path takes grouped-query heads as they are; SDPA only
+        # broadcasts them when asked (torch >= 2.5).
+        enable_gqa=q.shape[1] != k.shape[1],
+    )
 
 
 def _prepare_attn_mask(
@@ -220,6 +356,10 @@ def _int8_attention_cuda(
     scale: float | None = None,
     attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # Ahead of validation on purpose: a gated call does no padding, no mask
+    # preparation and no quantization, and SDPA validates what it is given.
+    if _int8_gated(q, k):
+        return _sdpa_fallback(q, k, v, scale=scale, attn_mask=attn_mask)
     attn_mask = _validate_inputs(q, k, v, attn_mask)
 
     original_head_dim = q.shape[-1]
@@ -345,6 +485,10 @@ def prequantize_int8_attention(
     This is an inference and peak-memory API. The regular :func:`int8_attention`
     remains the lower-overhead single-call path when early Q/K/V release is not
     needed.
+
+    Calling this is an explicit request for the INT8 path, so it is not subject
+    to the COMFY_KITCHEN_INT8_MIN_QK short-sequence gate: there is nothing left
+    to fall back to once the floating-point inputs are gone.
     """
     attn_mask = _validate_inputs(q, k, v, attn_mask)
 
@@ -626,6 +770,14 @@ def int8_attention(
     Softmax score, maximum, exponential, denominator, reciprocal, and V-scale
     arithmetic is FP32. This path does not allocate FP8 tensors or execute FP8
     MMA instructions.
+
+    The path only pays for itself on long sequences: quantizing Q, K and V is a
+    fixed cost per call that the faster kernel has to earn back. On the HIP
+    backend a call with q_len * kv_len below COMFY_KITCHEN_INT8_MIN_QK squared
+    (default 35840 per segment, the measured break-even) therefore runs as
+    scaled_dot_product_attention
+    with the caller's mask and scale, which is the same thing the flash baseline
+    computes. Set that variable to 0 to take the INT8 path unconditionally.
     """
     if attn_mask is None:
         return torch.ops.comfy_kitchen.int8_attention(
