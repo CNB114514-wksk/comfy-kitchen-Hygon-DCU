@@ -1835,10 +1835,16 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
         throw std::runtime_error(std::string(kFn) + ": output strides must match q");
     }
     // Rows are read four elements at a time, so every row start has to stay on
-    // that boundary.
+    // that boundary. A size-1 dimension never advances a row, and PyTorch's
+    // DLPack export normalizes its stride to 1 rather than the dense value, so
+    // it is exempt: a batch of one would otherwise be rejected over a stride the
+    // kernel multiplies by zero.
     const int64_t vectored[] = {q.stride(0), q.stride(1), k.stride(0), k.stride(1), k.stride(2)};
-    for (int64_t stride : vectored) {
-        if (stride % kElemsPerLoad != 0) {
+    const int64_t sizes[] = {static_cast<int64_t>(q.shape(0)), static_cast<int64_t>(q.shape(1)),
+                             static_cast<int64_t>(k.shape(0)), static_cast<int64_t>(k.shape(1)),
+                             static_cast<int64_t>(k.shape(2))};
+    for (int i = 0; i < 5; ++i) {
+        if (sizes[i] != 1 && vectored[i] % kElemsPerLoad != 0) {
             throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
         }
     }

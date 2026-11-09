@@ -59,7 +59,14 @@ __forceinline__ __device__ FloatVec<Width> load_bf16(const __bf16* p) {
     for (int i = 0; i < Width; i += 4) {
         const v4bf raw = *reinterpret_cast<const v4bf*>(p + i);
 #pragma unroll
-        for (int d = 0; d < 4; ++d) result[i + d] = static_cast<float>(raw[d]);
+        for (int d = 0; d < 4; ++d) {
+            // Width is HeadDim / kWave: four at wave32 (RDNA), two at wave64
+            // (the Hygon DCU). The load is four wide, so the last iteration of a
+            // narrower Width would store past the end of the vector -- an out of
+            // bounds write clang is free to miscompile. Keep the load, drop the
+            // tail.
+            if (i + d < Width) result[i + d] = static_cast<float>(raw[d]);
+        }
     }
     return result;
 }
